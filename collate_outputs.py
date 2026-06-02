@@ -2,7 +2,7 @@ from glob import glob
 import os
 from schisome import SchisomeDataSet
 
-run_tag = 'Feb26v1'
+run_tag = 'May26v2'
 data_paths = glob(f'datasets/*_{run_tag}.npz')
 
 ## ## Add Miguel's experimental lists
@@ -10,6 +10,11 @@ data_paths = glob(f'datasets/*_{run_tag}.npz')
 for data_path in data_paths:
    data_set = SchisomeDataSet(data_path, aux_marker_key='suborganelle')
    data_set.info(f'Finalising {data_path}')  
+   
+   tagm_path = 'markers/Arabidopsis_PBS_May26v1_nonnan_profiles_TAGM_MCMC_predictions.csv'
+   mkey = data_set.comparison_markers_key
+   data_set.add_scored_markers(mkey, tagm_path, id_col=1, class_col=3, score_col=4, score_thresh=0.95)
+   
    #data_set.reset_2d_proj()
    
    if not data_set.has_predictions:

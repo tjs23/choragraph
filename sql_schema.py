@@ -29,6 +29,7 @@ CREATE TABLE Protein (
   gene_name VARCHAR(32) NOT NULL,
   train_organelle VARCHAR(64),
   suborganelle VARCHAR(64),
+  alt_organelle VARCHAR(64),
   singleness FLOAT,
   likely_single INT,
   pred_class1 VARCHAR(64),

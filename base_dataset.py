@@ -50,6 +50,7 @@ class BaseDataSet:
         self._raw_markers_key = 'organelle'
         self._train_markers_key = 'training'
         self._aux_markers_key = aux_marker_key
+        self._comp_markers_key = 'comparison'
         
         self._train_profile_key = 'init'
         self._latent_profile_key = 'latent'
@@ -172,13 +173,22 @@ class BaseDataSet:
     
         return self.get_marker_data(self._aux_markers_key)
 
-
     @property
     def aux_markers_key(self):
     
         return self._aux_markers_key
+
+    @property
+    def comparison_markers(self):
+    
+        return self.get_marker_data(self._comp_markers_key)
  
- 
+    @property
+    def comparison_markers_key(self):
+    
+        return self._comp_markers_key
+
+
     def _check_file_path(self, file_path):
         
         if not os.path.exists(file_path):
@@ -431,7 +441,10 @@ class BaseDataSet:
                 for pid, aids in zip(pids, alt_ids):
                     for aid in aids.split(';'):
                         self._id_map[aid] = set([pid])
-                    
+            
+            for pid in self.proteins:
+                self._id_map[pid] = set([pid])
+                     
         return self._id_map
             
             
@@ -954,6 +967,112 @@ class BaseDataSet:
             if key.startswith(PROJ_TAG):
                 self._delete_save_data(key)
                 
+                               
+    def add_scored_markers(self, label, file_path, id_col, class_col, score_col, score_thresh=0.95):
+    
+        self._check_pids('add markers')
+        
+        if label in self.marker_keys:
+            self.warn(f'Replacing marker set {label}')
+         
+        id_mapping = self.id_map
+        rev_id_map = self.rev_id_map
+        
+        pids = set(self.proteins)
+        klass_dict = {}
+        unknown = set()
+        
+        with open_file(file_path) as file_obj:
+            head1 = file_obj.readline()
+ 
+            for line in file_obj:
+                line = line.rstrip()
+                if not line:
+                    continue
+                
+                data = line.split(',')
+                
+                agi = data[id_col].strip('"')
+                klass = data[class_col].strip('"')
+                score = float(data[score_col])
+                
+                if score < score_thresh:
+                   continue
+                
+                agi = agi.upper()
+                klass = klass.upper()
+                
+                if klass == 'UNKNOWN':
+                    continue
+                
+                if agi.startswith('AT'):
+                
+                    if agi not in id_mapping:
+                        agi = agi.split('.')[0]
+ 
+                        if agi not in id_mapping:
+                            agi = agi + '.1'
+                            
+                            if agi not in id_mapping:
+                                unknown.add(agi)
+                                continue
+ 
+                    pid = list(id_mapping[agi])[0]
+                
+                else:
+                    pid = agi
+                    pid = pid.split(';')[0]
+                    pid = pid.split('-')[0]
+                    
+                    if pid not in pids:
+                        #print('##', pid, rev_id_map.get(pid), id_mapping.get(pid))
+                        if pid in rev_id_map:
+                            pid = list(rev_id_map[pid])[0]
+ 
+                        else:
+                            pid = id_mapping.get(pid, pid)
+ 
+                    
+                klass_dict[pid] = klass
+        
+        missing = set(klass_dict) - pids
+        
+        if unknown:
+            example = sorted(unknown)
+            if len(example) > 5:
+                example = example[:5] + ['...',]
+                
+            example = ', '.join(example)    
+            self.warn(f'Cannot match {len(unknown):,} marker protein IDs to UniProt IDs. {example}')
+
+        if missing:
+            self.warn(f'A total of {len(missing):,} marker protein IDs in "{file_path}" are not found in the main dataset.')
+            print(sorted(missing))
+        
+        klasses = list(set(klass_dict.values()))
+        klass_idx = {k:i for i, k in enumerate(klasses)}
+        
+        n = len(self.proteins)
+        marker_idx = np.empty((n,), dtype=int)
+        
+        n_added = 0
+        
+        for i, pid in enumerate(self.proteins):
+            if pid in klass_dict:
+                k = klass_idx[klass_dict[pid]]
+                n_added += 1
+            else:
+                k = -1
+                
+            marker_idx[i] = k
+        
+        new_data = {MARKER_LABELS_TAG + label: np.array(klasses),
+                                MARKER_CLASSES_TAG + label: marker_idx}
+        
+        self._save_data(new_data)
+
+        self.info(f'Added markers "{label}": {n_added:,} proteins in {len(klasses)} classes')
+                
     def add_markers(self, label, file_path):
     
         self._check_pids('add markers')
@@ -1090,7 +1209,7 @@ class BaseDataSet:
 
 
                          
-    def write_profile_tsv(self, out_file_path, profiles=None, markers=None, write_blank=False):
+    def write_profile_tsv(self, out_file_path, profiles=None, markers=None, write_blank=False, max_nan=None):
         
         if markers is True:
             markers = self.marker_keys
@@ -1162,14 +1281,18 @@ class BaseDataSet:
             line = '\t'.join(header) + '\n'
             write(line)
             
-            for i, pid in enumerate(self.proteins):
+            for i, pid in enumerate(sorted(set(self.proteins))):
                 prof_vals = []
                 n_blank = 0
-                
+                n_nan = 0
                 
                 for label in profiles: # ordered
                     prof_dict = prof_dicts[label]
                     row = prof_dict[pid]
+                    
+                    if max_nan is not None:
+                        n_nan += np.count_nonzero(np.isnan(row))
+                    
                     prof_vals += ['%.7f' % x for x in row]
                     
                     if not write_blank:
@@ -1180,6 +1303,9 @@ class BaseDataSet:
                             n_blank += 1
                 
                 if not write_blank and (n_blank == n_profs):
+                    continue
+                
+                if (max_nan is not None) and (n_nan > max_nan):
                     continue
                 
                 marker_klasses = []

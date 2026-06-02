@@ -1294,13 +1294,18 @@ class SchisomeDataSet(BaseDataSet):
         plt.show()
             
 
-    def plot_contingency_table(self, marker_label, marker_title='Training Class',
+    def plot_contingency_table(self, marker_label, pred_label=None, marker_title='Training Class', pred_title='Predicted Class', 
                                save_path=None, fontsize=8):
 
         cmap = LinearSegmentedColormap.from_list(name='CMAP01', colors=['#FFFFFF', '#4080FF'], N=25)
         cmap.set_bad('#DDDDCD', 1.0)
         
-        pred_labels = self.train_labels
+        if pred_label:
+            pred_labels = self.get_marker_labels(pred_label)
+        else:
+            pred_labels = self.train_labels
+        
+        
         marker_labels = self.get_marker_labels(marker_label)
         
         all_labels = set(pred_labels) & set(marker_labels) - set(['unknown','DUAL'])
@@ -1308,9 +1313,12 @@ class SchisomeDataSet(BaseDataSet):
         u = len(all_labels) - 1
         
         idx = {x:i for i, x in enumerate(all_labels)}
+        markers = self.get_marker_data(marker_label)
         
-        markers = self.get_marker_data(marker_label)        
-        predictions = self.class_ensemble_preds.mean(axis=1).argmax(axis=-1)
+        if pred_label:
+            predictions = self.get_marker_data(pred_label)
+        else:     
+            predictions = self.class_ensemble_preds.mean(axis=1).argmax(axis=-1)
         
         # Map separate to common idx ; old to new
         map_pred_idx    = {i:idx[x] for i, x in enumerate(pred_labels)}
@@ -1319,7 +1327,6 @@ class SchisomeDataSet(BaseDataSet):
         map_marker_idx[1+len(marker_labels)] = u
         map_pred_idx[len(pred_labels)] = u
         map_marker_idx[len(marker_labels)] = u
-        
 
         valid = (markers >= 0) | (predictions >= 0)
         
@@ -1380,7 +1387,7 @@ class SchisomeDataSet(BaseDataSet):
         ax.yaxis.set_label_position("right")
         
         ax.set_xlabel(marker_title, fontsize=14, va="bottom")
-        ax.set_ylabel('Predicted Class', fontsize=14, rotation=270, va="bottom")
+        ax.set_ylabel(pred_title, fontsize=14, rotation=270, va="bottom")
         
         if save_path:
             plt.savefig(save_path, dpi=400)
@@ -2156,7 +2163,7 @@ class SchisomeDataSet(BaseDataSet):
         import sqlite3
         
         aux_annos = self._aux_markers_key
-        print('Aux', aux_annos)
+        alt_annos = self._comp_markers_key
         
         if 'pval' not in self.array_keys: 
             self.make_class_predictions() # prediction classes, pval, dulity etc.
@@ -2198,10 +2205,13 @@ class SchisomeDataSet(BaseDataSet):
 
         class_labels2 = self.get_marker_labels(aux_annos) + ['UNKNOWN']
         suborganelles = [class_labels2[x] for x in self.get_marker_data(aux_annos)]
+
+        class_labels3 = self.get_marker_labels(alt_annos) + ['UNKNOWN']
+        alt_organelles = [class_labels3[x] for x in self.get_marker_data(alt_annos)]
         
         self.info('Add Compartments')
         cursor = connection.cursor()
-        codes = set([DB_ORGANELLE_CONV_DICT.get(code, code) for code in organelles + suborganelles])
+        codes = set([DB_ORGANELLE_CONV_DICT.get(code, code) for code in organelles + suborganelles + alt_organelles])
         inserts = [(code, DB_ORGANELLE_INFO[code][0], DB_ORGANELLE_INFO[code][1]) for code in codes]
 
         cursor.executemany('INSERT INTO Compartment (code, name, color) VALUES (?,?,?)', inserts)
@@ -2243,6 +2253,25 @@ class SchisomeDataSet(BaseDataSet):
         
         projections = []
         for src in proj_srcs:
+        
+            for method in ('umap', 'pca'):
+                text = f'{proj_names[src]} {method.upper()}'
+                
+                if method == 'umap':
+                    for nn in (50,30,10):
+                        key = f'{src}_{method}_{nn}'
+                        self.info(f' .. {key}')
+                        text = f'{proj_names[src]} {method.upper()} NN{nn}'
+                        projections.append((key, text))
+                        proj_2d[key] = self.get_profile_proj_2d(src, method, min_nonzero=min_nonzero, recalc=False, umap_neighbours=nn)
+                
+                else:
+                    key = f'{src}_{method}'
+                    text = f'{proj_names[src]} {method.upper()}'
+                    projections.append((key, text))
+                    self.info(f' .. {key}')
+                    proj_2d[key] = self.get_profile_proj_2d(src, method, min_nonzero=min_nonzero, recalc=False)
+                
             for name, klasses in restrict_groups.items():
                 key = f'{src}_UMAP_{name}'
                 text = f'{proj_names[src]} UMAP {name}'
@@ -2262,24 +2291,6 @@ class SchisomeDataSet(BaseDataSet):
                 proj_2d[key] = proj_model.transform(profile_data_all)
                 proj_2d[key][invalid] = 0.0
                 proj_2d[key][~selection] = 0.0
-        
-            for method in ('umap', 'pca'):
-                text = f'{proj_names[src]} {method.upper()}'
-                
-                if method == 'umap':
-                    for nn in (50,30,10):
-                        key = f'{src}_{method}_{nn}'
-                        self.info(f' .. {key}')
-                        text = f'{proj_names[src]} {method.upper()} NN{nn}'
-                        projections.append((key, text))
-                        proj_2d[key] = self.get_profile_proj_2d(src, method, min_nonzero=min_nonzero, recalc=False, umap_neighbours=nn)
-                
-                else:
-                    key = f'{src}_{method}'
-                    text = f'{proj_names[src]} {method.upper()}'
-                    projections.append((key, text))
-                    self.info(f' .. {key}')
-                    proj_2d[key] = self.get_profile_proj_2d(src, method, min_nonzero=min_nonzero, recalc=False)
                 
         cursor = connection.cursor()
         cursor.executemany('INSERT INTO DataProjection (code, name) VALUES (?,?)', projections)
@@ -2325,6 +2336,7 @@ class SchisomeDataSet(BaseDataSet):
 
             train_organelle = DB_ORGANELLE_CONV_DICT.get(organelles[i], organelles[i])
             suborganelle = DB_ORGANELLE_CONV_DICT.get(suborganelles[i], suborganelles[i])
+            alt_organelle = DB_ORGANELLE_CONV_DICT.get(alt_organelles[i], alt_organelles[i])
                       
             likely_single = 'YES' if float(singleness[i]) > 0.9 else 'NO'
             
@@ -2350,7 +2362,7 @@ class SchisomeDataSet(BaseDataSet):
             
             pred_text = '+'.join([x[1] for x in sorted(pred_anno, reverse=True)])
             protein_inserts.append((pid, alt_ids, description, gene_name, train_organelle,
-                                    suborganelle, singleness[i], likely_single, pred_class1,
+                                    suborganelle, alt_organelle, singleness[i], likely_single, pred_class1,
                                     pred_class2, pred_class3, pred_text, pvals[i], pvals_single[i],
                                     pvals_dual[i], completeness[i], novelty[i]))    
             
@@ -2364,7 +2376,8 @@ class SchisomeDataSet(BaseDataSet):
                 if x * y:
                     protein_coord_inserts.append((key, pid, x, y))
 
-        sql_smt = 'INSERT INTO Protein (pid, alt_ids, description, gene_name, train_organelle, suborganelle, singleness, likely_single, pred_class1, pred_class2, pred_class3, pred_text, p_val, p_val_single, p_val_dual, completeness, novelty) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+        sql_smt = 'INSERT INTO Protein (pid, alt_ids, description, gene_name, train_organelle, suborganelle, alt_organelle, '\
+                  'singleness, likely_single, pred_class1, pred_class2, pred_class3, pred_text, p_val, p_val_single, p_val_dual, completeness, novelty) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
         _chunked_execute(connection, protein_inserts, sql_smt) 
         self.info(f'Stored {len(protein_inserts):,} proteins to {db_file_path}')
 
