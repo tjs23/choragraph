@@ -1,128 +1,64 @@
-# A script to gather training input and labels for DNN
-#   Gather proteomic profiles for each database
-#   Normalise proteomic profiles
-#   Add marker lists for each dataset
-#   Prune markler list to make training sets
-
+import argparse
 import os
 from glob import glob
-from schisome import SchisomeDataSet
+from schisome import ChoragraphDataSet
 
-if not os.path.exists('datasets'):
-    os.mkdir('datasets')
+# Global configuration defaults
+DEFAULT_SPARSE_CLASSES = ['EXTRACELLULAR', 'CORTEX', 'PROTEASOMAL', 'RIBOSOMAL']
 
-run_tag = 'Feb26v1'
+def main():
+    parser = argparse.ArgumentParser(description="ofiles into Choragraph data sets from the command line.")
+    
+    # Required arguments with short and long variants
+    parser.add_argument('-r', '--run-tag', required=True, 
+                        help="Identifier for the current run (e.g., Arabidopsis_Jun26)")
+    parser.add_argument('-p', '--profile-pattern', required=True, 
+                        help="Glob pattern for profile TSV files (e.g., 'profiles/*_replica[0-7].tsv')")
+    parser.add_argument('-o', '--organelle-markers', required=True, 
+                        help="Path to the organelle markers CSV file")
+    parser.add_argument('-u', '--suborganelle-markers', required=True, 
+                        help="Path to the suborganelle markers CSV file")
+    
+    # Optional arguments with short and long variants
+    sparse_classes_str = ", ".join(DEFAULT_SPARSE_CLASSES)
+    parser.add_argument('-c', '--sparse-classes', nargs='+', default=DEFAULT_SPARSE_CLASSES,
+                        help=f"Space-separated list of sparse classes to prune. Default: {sparse_classes_str}")
+    parser.add_argument('-d', '--output-dir', default='datasets', 
+                        help="Directory where output files will be saved")
 
-plot_args = dict(min_nonzero=0.9, spot_size=16)
+    args = parser.parse_args()
 
+    # Ensure output directory exists
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
 
-# # # # # # # # # # # # # # # # # # # # 
+    # Find profile paths using the provided glob pattern
+    profile_paths = glob(args.profile_pattern)
+    if not profile_paths:
+        print(f"Warning: No files matched the pattern: {args.profile_pattern}")
 
-source_tag = 'Arabidopsis_PCSC'
+    # Construct the base data path
+    data_path = os.path.join(args.output_dir, f'{args.run_tag}.npz')
 
-profile_paths = glob('profiles/Arabidposis_PCSC_R?.tsv')
+    # Initialize dataset with fixed 'suborganelle' label
+    dataset = ChoragraphDataSet(data_path, args.run_tag, aux_marker_key='suborganelle')
+    dataset.add_raw_profiles(profile_paths)
+    
+    # Add markers with fixed 'organelle' and 'suborganelle' keys
+    dataset.add_markers('organelle', args.organelle_markers)
+    dataset.add_markers('suborganelle', args.suborganelle_markers)
 
-data_path = f'datasets/{source_tag}_{run_tag}.npz'
+    # Always prune using 'organelle' and 'training' inputs
+    dataset.prune_markers('organelle', 'training', sparse_classes=args.sparse_classes)
 
-at_dataset = SchisomeDataSet(data_path, source_tag, aux_marker_key='suborganelle')
-at_dataset.add_raw_profiles(profile_paths)
-at_dataset.add_markers('organelle', 'markers/Arabidopsis_organelle_Feb26.csv')
-at_dataset.add_markers('suborganelle', 'markers/Arabidopsis_suborganelle_Feb23.csv')
+    # Export profile TSVs
+    profile_tsv_path = os.path.join(args.output_dir, f'{args.run_tag}_profiles.tsv')   
+    dataset.write_profile_tsv(profile_tsv_path, profiles=['init'], markers=['training'])
 
-at_dataset.normalize_profiles_max('init')
-at_dataset.prune_markers('organelle', 'training', sparse_classes=['EXTRACELLULAR'])
-
-#at_dataset.plot_umap_2d('init', ['organelle', 'training'], ['Organelle markers', 'Training'], **plot_args)
-
-
-# # # # # # # # # # # # # # # # # # # # 
-
-"""
-source_tag = 'Human_U2OS'
-
-profile_paths = ['profiles/Human_U2OS_all.tsv']
-
-# Curated markers from data orig publication
-
-data_path = f'datasets/{source_tag}_{run_tag}.npz'
-
-hs_dataset = SchisomeDataSet(data_path, source_tag, aux_marker_key='uniprot')
-hs_dataset.add_raw_profiles(profile_paths)
-hs_dataset.normalize_profiles_max('init')
-
-hs_dataset.add_markers('organelle', 'markers/Human_U2OS_markers_nocplx.csv')
-hs_dataset.add_markers('hpa', 'markers/Human_HPA_subcellular_location.tsv')
-
-if not os.path.exists('markers/Human_UniProt_all.csv'):
-    hs_dataset.add_uniprot_markers('uniprot')
-    hs_dataset.write_markers('uniprot', 'markers/Human_UniProt_all.csv')
-else:
-    hs_dataset.add_markers('uniprot',   'markers/Human_UniProt_all.csv')
-
-hs_dataset.prune_markers('organelle', 'training')  
-
-#hs_dataset.plot_umap_2d('init', ['organelle', 'uniprot', 'training'], ['SVM markers', 'UniProt', 'Training'], **plot_args)
-
-# UniProt derived markers
-
-data_path2 = f'datasets/{source_tag}_UniProt_{run_tag}.npz'
-
-hs_dataset2 = SchisomeDataSet(data_path2, source_tag, aux_marker_key='svn_in')
-hs_dataset2.add_raw_profiles(profile_paths)
-hs_dataset2.normalize_profiles_max('init')
-
-hs_dataset2.add_markers('organelle', 'markers/Human_UniProt_all.csv')
-hs_dataset2.add_markers('svn_in',    'markers/Human_U2OS_markers_nocplx.csv')
-hs_dataset2.add_markers('hpa', 'markers/Human_HPA_subcellular_location.tsv')
-
-hs_dataset2.prune_markers('organelle', 'training', sparse_classes=['ENDOSOME'])  
-
-hs_dataset2.plot_umap_2d('init', ['organelle', 'hpa', 'training'], ['UniProt', 'HPA', 'Training'], **plot_args)
-
-
-"""
-"""
-
-# # # # # # # # # # # # # # # # # # # # 
-
-
-source_tag = 'Mouse_E14'
-
-profile_paths = ['profiles/Mouse_E14_R1.csv',
-                 'profiles/Mouse_E14_R2.csv']
-
-# Curated markers from data orig publication
-
-data_path = f'datasets/{source_tag}_{run_tag}.npz'
-
-mm_dataset = SchisomeDataSet(data_path, source_tag, aux_marker_key='TAGM_good')
-mm_dataset.add_raw_profiles(profile_paths)
-mm_dataset.normalize_profiles_max('init')
- 
-mm_dataset.add_markers('organelle',  'markers/Mouse_E14_markers.csv')
-mm_dataset.add_markers('TAGM_good',  'markers/Mouse_E14_TAGMgood.csv')
-mm_dataset.prune_markers('organelle', 'training')  
-
-# Get Uniprot markers; save these for next time
-if not os.path.exists('markers/Mouse_UniProt_all.csv'):
-    mm_dataset.add_uniprot_markers('uniprot')
-    mm_dataset.write_markers('uniprot', 'markers/Mouse_UniProt_all.csv')
-else:
-    mm_dataset.add_markers('uniprot',   'markers/Mouse_UniProt_all.csv')
-
-#mm_dataset.plot_umap_2d('init', ['organelle', 'TAGM_good', 'training'], ['TAGM markers', 'TAGM good', 'Training'], **plot_args)
-
-# UniProt derived markers
-
-data_path2 = f'datasets/{source_tag}_UniProt_{run_tag}.npz'
-
-mm_dataset2 = SchisomeDataSet(data_path2, source_tag, aux_marker_key='TAGM_good')
-mm_dataset2.add_raw_profiles(profile_paths)
-mm_dataset2.normalize_profiles_max('init')
-
-mm_dataset2.add_markers('organelle',  'markers/Mouse_UniProt_all.csv')
-mm_dataset2.add_markers('TAGM_good',  'markers/Mouse_E14_TAGMgood.csv')
-mm_dataset2.prune_markers('organelle', 'training')  
-
-#mm_dataset2.plot_umap_2d('init', ['organelle', 'TAGM_good', 'training'], ['UniProt', 'TAGM good', 'Training'], **plot_args)
-"""
+    nonnan_profile_tsv_path = os.path.join(args.output_dir, f'{args.run_tag}_nonnan_profiles.tsv')   
+    dataset.write_profile_tsv(nonnan_profile_tsv_path, profiles=['init'], markers=['training'], max_nan=0)   
+    
+    print(f"Info: Wrote dataset to {data_path}")
+    
+if __name__ == '__main__':
+    main()

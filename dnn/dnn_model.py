@@ -2,13 +2,10 @@ import os, sys, time
 import numpy as np
 from collections import defaultdict
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
 import keras
 import tensorflow as tf
 
 from keras import layers, ops, metrics
-#from tensorflow_probability.substrates import jax as tfp
 import tensorflow_probability as tfp
 
 sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
@@ -292,12 +289,14 @@ def get_model(data_generator, ndim_compress=10, nlayers_att=4, nheads_att=2, noi
  
  
 def train_model(model_path, test_idx, train_idx, profiles, class_labels, replica_cols, 
-                n_mix=500, n_epochs=100, batch_size=32, init_learning_rate=1e-3,
+                n_mix=500, nomix_classes=None, n_epochs=100, batch_size=32, init_learning_rate=1e-3,
                 ndim_compress=10, nlayers_att=4, nheads_att=2):
-  
+    
+    nomix_classes = set(nomix_classes or [])
+    
     # Test and train on-the-fly data generators to create mixed profiles and classes
-    data_generator = MixedLocReconstructDataGenerator(train_idx, profiles, class_labels, replica_cols, n_mix=n_mix)
-    data_generator_test = MixedLocReconstructDataGenerator(test_idx, profiles, class_labels, replica_cols, training=False, n_mix=n_mix)
+    data_generator = MixedLocReconstructDataGenerator(train_idx, profiles, class_labels, replica_cols, n_mix=n_mix, nomix=nomix_classes)
+    data_generator_test = MixedLocReconstructDataGenerator(test_idx, profiles, class_labels, replica_cols, training=False, n_mix=n_mix, nomix=nomix_classes)
 
     model = get_model(data_generator, ndim_compress, nlayers_att, nheads_att)
     

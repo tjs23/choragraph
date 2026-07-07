@@ -114,7 +114,7 @@ class MixedLocReconstructDataGenerator(BaseGenerator):
     
     def __init__(self, iter_idx, profiles_in, known_klasses, replica_cols, batch_size=32,
                  training=True, mask_min=0.05, mask_max=0.25, mask_val=0.0, rep_mask=0.25,
-                 n_mix=250, nan_val=0.0, max_null_corr=0.5):
+                 n_mix=250, nomix=None, nan_val=0.0, max_null_corr=0.5):
         
         max_class = known_klasses.max()
         max_class += 1
@@ -145,7 +145,7 @@ class MixedLocReconstructDataGenerator(BaseGenerator):
         self.n_batches = int(math.ceil(ni/batch_size))
         self.n_classes = max_class + 1 # Add one for on-the-fly null class
         self.n_mix = n_mix
-        self.known_klasses = known_klasses # array of class indices ; reserve 0 for unknown/fake/random
+        self.known_klasses = known_klasses # array of class indices 
         self.mask_min = max(1, int(mask_min * profiles_in.shape[1]))
         self.mask_max = int(mask_max * profiles_in.shape[1])
         self.mask_val = mask_val
@@ -154,6 +154,7 @@ class MixedLocReconstructDataGenerator(BaseGenerator):
         self.replica_cols = replica_cols
         self.max_null_corr = max_null_corr
         self.ran_seed = randint(1, 2**31-1)
+        self.nomix = set(nomix or [])
         
         super().__init__(iter_idx, profiles_in, batch_size, training, nan_val)
                 
@@ -168,6 +169,7 @@ class MixedLocReconstructDataGenerator(BaseGenerator):
         iter_idx = self.iter_idx
         mix_idx    = [i for i in iter_idx if known[i] >= 0] # Negative is unknown
         n_mix = self.n_mix
+        nomix = self.nomix
         
         max_klass = known.max()
         
@@ -216,18 +218,35 @@ class MixedLocReconstructDataGenerator(BaseGenerator):
  
                 for klass in range(n_klass):
                     klass_idx[klass] = (known == klass).nonzero()[0]
-
+                
+                # Non mixing classes, e.g. ribosome
+                for i in nomix:
+                    kidx1 = klass_idx[i]
+                    kidx2 = kidx1[:]
+                    n1 = len(kidx1)
+                    
+                    np.random.shuffle(kidx1)
+                    np.random.shuffle(kidx2)
+               
+                    pair_idx += [(kidx1[q % n1], kidx2[q % n1]) for q in range(n_mix)]
+               
                 # From each class to each other: get same num protein pairs for each dual class combo
                 for i in range(0, n_klass):
+                    if i in nomix:
+                        continue 
+                        
                     kidx1 = klass_idx[i]
                     n1 = len(kidx1)
                     
                     if not n1:
                         print(f'Class {i} empty')
-                        continue
- 
+                        continue                    
+                    
                     for j in range(i,n_klass):
-                        kidx2 = klass_idx[j]
+                        if j in nomix:
+                            continue
+                        
+                        kidx2 = klass_idx[j][:]
                         n2 = len(kidx2)
                         
                         if not n2:

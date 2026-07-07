@@ -1,5 +1,6 @@
 import os, math, colorsys
 from collections import defaultdict
+from bisect import insort
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,18 +8,20 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ColorConverter, LinearSegmentedColormap
 from matplotlib import cm
 from scipy import stats
-
+from scipy.cluster import hierarchy
+from scipy.spatial import distance
+ 
 from constants import COLOR_DICT, DB_ORGANELLE_CONV_DICT, DB_ORGANELLE_INFO
 from sql_schema import DB_SCHEME
-from base_dataset import BaseDataSet, SchisomeException
+from base_dataset import BaseDataSet, ChoragraphException
 from general_util import parallel_run, MAX_CORES
 
-class SchisomeDataSet(BaseDataSet):
+class ChoragraphDataSet(BaseDataSet):
     """
     This class extends the BaseDataset with DNN, plotting and analysis methods
     """    
     
-    def __init__(self, file_path, source_tag=None, aux_marker_key=None):
+    def __init__(self, file_path, name=None, source_tag=None, aux_marker_key=None):
         
         super().__init__(file_path, aux_marker_key)
                 
@@ -27,18 +30,23 @@ class SchisomeDataSet(BaseDataSet):
             
         else:
             save_dict = self._get_save_dict()
-            source_tag = str(save_dict.get('source_tag'))
+            source_tag = save_dict.get('source_tag')
 
         if not source_tag:
             msg = 'File for dataset does not contain "source_tag" and none was specified'
-            raise SchisomeException(msg)
+            raise ChoragraphException(msg)
          
-        self.source_tag = source_tag
-    
+        self.source_tag = str(source_tag)
+        
+        if name:
+           self.name = name
+        else:
+           self.name = source_tag
+        
     
     def _plot_proj_2d(self, profile_labels, class_labels, titles, proj_methods,
-                      title=None, save_path=None, min_nonzero=0.8, spot_size=10,
-                      color_dict=None, label_ids=None):
+                      title=None, save_path=None, min_nonzero=0.65, spot_size=10,
+                      color_dict=None, label_ids=None, legend_title=None, cmap=None):
         
         if isinstance(profile_labels, str):
             profile_labels = [profile_labels]
@@ -81,20 +89,21 @@ class SchisomeDataSet(BaseDataSet):
             else:
                 avail = ', '.join(self.array_keys + self.marker_keys + self.pred_classes_labels)
                 msg = f'Data track label "{class_label}" not known in data set. Available: {avail}'
-                raise SchisomeException(msg)
+                raise ChoragraphException(msg)
         
         self.plot_proj_2d(profile_labels, class_labels, proj_methods, titles,
                           title=title, min_nonzero=min_nonzero, save_file=save_path,
-                          color_dict=color_dict, spot_size=spot_size, label_ids=label_ids)    
+                          color_dict=color_dict, spot_size=spot_size, label_ids=label_ids,
+                          legend_title=legend_title, cmap=cmap)    
     
     
-    def plot_class_restricted_umap_2d(self, classes, plot_size=8.0, spot_size=16,
-                                      alpha=1.0, max_missing=0.35, min_score=0.30, save_file=None):
+    def plot_class_restricted_umap_2d(self, classes, plot_size=8.0, spot_size=16, title=None,
+                                      alpha=1.0, max_missing=0.35, min_score=0.30, save_path=None):
         
         from umap import UMAP
                 
         classes = sorted(classes)
-        class_title = ", ".join(classes)
+        class_title = title or  ", ".join(classes)
         self.info(f'Plotting class-restricted UMAP for {class_title}')
 
         latent_key = self.latent_profile_key
@@ -105,9 +114,7 @@ class SchisomeDataSet(BaseDataSet):
         pred_data = self.class_ensemble_preds
         init_profiles = self.train_profiles
         n, m = init_profiles.shape
-        valid = np.count_nonzero(np.isnan(init_profiles), axis=-1) <= int(max_missing*m) # E.g. one third
-        pred_data = pred_data[valid]
- 
+
         class_labels = self.train_labels + ['UNKNOWN']
         class_mean = pred_data.mean(axis=1)
  
@@ -116,13 +123,19 @@ class SchisomeDataSet(BaseDataSet):
         selection = class_scores.sum(axis=1) >= min_score
         
         class_scores = class_scores[selection] # n1, k
+        pred_data = pred_data[selection]
+        init_profiles = init_profiles[selection]
+        
+        valid = np.count_nonzero(np.isnan(init_profiles), axis=-1) <= int(max_missing*m) # E.g. one third
+        best = np.count_nonzero(np.isnan(init_profiles), axis=-1) <= int(0.2*m)
+        
         n_plot = len(class_scores)
         
         profile_labels = [recon_key, latent_key]
-        titles = ['Reconstructed','Latent']
+        titles = ['Denoised','Latent']
         n_cols = len(profile_labels)
         
-        plt.style.use('dark_background')
+        #plt.style.use('dark_background')
         fig, axarr = plt.subplots(1, n_cols, squeeze=False)
         fig.set_size_inches(n_cols * plot_size, plot_size)
         
@@ -136,19 +149,22 @@ class SchisomeDataSet(BaseDataSet):
         for col, profile_label in enumerate(profile_labels):
             ax = axarr[0, col]
  
-            profile_data = self.get_profile_data(profile_label)[valid][selection]
+            profile_data = self.get_profile_data(profile_label)[selection][valid]
             profile_data = np.nan_to_num(profile_data)
 
-            self.info(f' .. compute UMAP for {profile_label}')
-            kernel = UMAP(n_components=2, n_neighbors=50, min_dist=0.1, metric='correlation', random_state=7)
+            profile_data_best = self.get_profile_data(profile_label)[selection][best]
+            profile_data_best = np.nan_to_num(profile_data_best)
 
-            proj_model = kernel.fit(profile_data)
+            self.info(f' .. compute UMAP for {profile_label}')
+            kernel = UMAP(n_components=2, n_neighbors=30, min_dist=0.1, metric='correlation', random_state=7)
+
+            proj_model = kernel.fit(profile_data_best)
             proj_2d = proj_model.transform(profile_data)
  
             x_vals, y_vals = proj_2d.T
         
-            ax.scatter(x_vals, y_vals, s=spot_size, alpha=alpha, marker='.', c=colors)
-            ax.set_title(profile_label)
+            ax.scatter(x_vals, y_vals, s=spot_size, alpha=alpha, marker='.', c=colors[valid])
+            ax.set_title(titles[col])
         
         for k, klass in enumerate(classes):
             ax.scatter([], [], label=klass, c=class_colors[k], s=spot_size, alpha=alpha, marker='.')
@@ -158,20 +174,22 @@ class SchisomeDataSet(BaseDataSet):
         fig.suptitle(f'UMAP {class_title} [{n_plot:,}/{n:,}]', fontsize=16)
         plt.subplots_adjust(left=0.03, bottom=0.05, right=0.95, top=0.92, wspace=0.1, hspace=0.1)
  
-        if save_file:
-            plt.savefig(save_file, dpi=400)
+        if save_path:
+            plt.savefig(save_path, dpi=400)
             plt.clf()
-            self.info(f'Saved image to {save_file}')
+            self.info(f'Saved image to {save_path}')
  
         else:
             plt.show()
         
 
     def _plot_single_scatter_2d(self, ax, profile_label, class_label, proj_method, title,
-                                size, min_nonzero=0.8, color_dict=None, label_ids=None, duals=False):
+                                size, alpha, min_nonzero=0.65, color_dict=None,
+                                label_ids=None, duals=False, cmap=None):
 
         profile_data = self.get_profile_data(profile_label)
         profile_data = np.nan_to_num(profile_data)
+        valid = self.get_valid_mask(min_nonzero)
  
         if self.has_pred_class_key(class_label):
             score_array = self.get_pred_class_data(class_label)
@@ -189,11 +207,21 @@ class SchisomeDataSet(BaseDataSet):
  
         elif self.has_array_key(class_label):
             vals = self.get_array_data(class_label)
-            vmin = vals.min()
-            vmax = vals.max()
-            scale = np.arange(vmin, vmax, 11)
-            class_array = np.searchsorted(scale, vals)
-            class_labels = [f'{x}' for x in scale[1:]]
+            vmin = vals[valid].min()
+            vmax = vals[valid].max()
+               
+            scale = np.linspace(vmin, vmax, 11)
+            
+            vals -= vmin
+            vals /= vals[valid].max()
+            class_array = (10 * vals).astype(int)
+            
+            if max(abs(vmin), vmax) > 1:
+                 class_labels = [f'{int(x)}' for x in scale]
+            
+            else:
+                 class_labels = [f'{x:.2f}' for x in scale]
+ 
         
         elif self.has_marker_key(class_label):
             class_array = self.get_marker_data(class_label)
@@ -204,10 +232,9 @@ class SchisomeDataSet(BaseDataSet):
         
         else:
             msg = f'Data track "{class_label}" not known in data set.'
-            raise SchisomeException(msg)
+            raise ChoragraphException(msg)
  
         n, m = profile_data.shape
-        valid = self.get_valid_mask(min_nonzero)
  
         select_idx = np.zeros(n, int)
         proteins = self.proteins
@@ -230,7 +257,10 @@ class SchisomeDataSet(BaseDataSet):
         select_idx = select_idx[valid]
         class_array = class_array[valid]
 
-        cmap = cm.get_cmap('afmhot')
+        #cmap = cm.get_cmap('Blues')
+        if cmap is None:
+            cmap = LinearSegmentedColormap.from_list(name='CMAP01', colors=['#0000FF', '#FF0000', '#000000'], N=25)
+        
         n_points = len(x_vals)
         n_marked = 0
  
@@ -251,33 +281,35 @@ class SchisomeDataSet(BaseDataSet):
  
                  txt = selection[pid]
                  ax.text(x_vals[i], y_vals[i], txt, fontsize=5, color='#B0B0B0', zorder=0)
- 
+        
+        k = len(class_labels)
         for i, klass in enumerate(class_labels):
  
             idx = (class_array == i).nonzero()[0]
  
             if klass in color_dict:
                 color = color_dict[klass]
- 
             else:
                 color = cmap(i/float(len(class_labels)))
 
             if len(idx):
 
                 if klass in ('unknown', 'DUAL', 'no-TM', 'UNKNOWN'):
-                    alpha = 0.2
+                    salpha = 0.15
                     zorder = 0
- 
+                    ssize = size //2
+                    
                     if klass == 'DUAL':
                         marker = '*'
                     else:
                         marker = '.'
  
                 else:
-                    alpha = 0.75
-                    zorder = 1+i
+                    salpha = alpha
+                    zorder = i+1 # k-i
                     marker = '.'
                     n_marked += len(idx)
+                    ssize = size
  
                 label = klass.replace('OUTER MEMBRANE','OM',)
                 label = label.replace('INNER MEMBRANE','IM',)
@@ -293,18 +325,20 @@ class SchisomeDataSet(BaseDataSet):
                     ax.scatter([], [], s=size, alpha=1.0, marker=marker, color=color, label=label)
  
                 else:
-                    ax.scatter(x_vals[idx], y_vals[idx], s=size, alpha=alpha, marker=marker, zorder=zorder, label=label, color=color)
+                    ax.scatter(x_vals[idx], y_vals[idx], s=ssize, alpha=salpha, marker=marker, zorder=zorder, label=label, color=color)
  
- 
-        ax.set_title(f'{title} {n_marked:,}/{n_points:,}')
+        if n_marked != n_points:
+            ax.set_title(f'{title} {n_marked:,}/{n_points:,}')
+        else:
+            ax.set_title(f'{title}')
     
         return profile_data, (x_vals, y_vals)
 
     
     
     def plot_proj_2d(self, profile_labels, marker_labels, proj_methods=['umap'], titles=None,
-                     title=None, min_nonzero=0.8, plot_size=8.0, spot_size=10, alpha=0.25,
-                     save_file=None, color_dict=None, label_ids=None):
+                     title=None, min_nonzero=0.65, plot_size=5.0, spot_size=16, alpha=0.5,
+                     save_file=None, color_dict=None, label_ids=None, legend_title=None, cmap=None):
          
         title_dict = {'umap':'UMAP','p-umap':'parametric-UMAP','pca':'PCA','tsne':'t-SNE',}
  
@@ -319,28 +353,34 @@ class SchisomeDataSet(BaseDataSet):
  
         if not titles:
             titles = [title_dict[method] for method in proj_methods]
- 
+        
+        if cmap:
+            if not isinstance(cmap, (list, tuple)):
+               cmap = [cmap]
+        else:
+            cmap = [None]
+        
+        n_cmap = len(cmap)
         n_cols = len(proj_methods)
- 
+        
+        #plt.style.use('dark_background')
+        
         fig, axarr = plt.subplots(1, n_cols, squeeze=False)
         fig.set_size_inches(n_cols * plot_size, plot_size)
 
         for col, profile_label in enumerate(profile_labels):
             marker_label = marker_labels[col]
             proj_method = proj_methods[col]
- 
+            
             self._plot_single_scatter_2d(axarr[0,col], profile_label, marker_label,
-                                         proj_method, titles[col], spot_size, min_nonzero,
-                                         color_dict, label_ids)
+                                         proj_method, titles[col], spot_size, alpha,
+                                         min_nonzero, color_dict, label_ids, cmap=cmap[col % n_cmap])
  
-            axarr[0,col].legend(fontsize=7) # , loc='upper left')
+            axarr[0,col].legend(fontsize=5, title_fontsize=8, title=legend_title) # , loc='upper left')
  
         fig.suptitle('{}'.format(title), fontsize=16)
  
-        plt.subplots_adjust(left=0.03, bottom=0.05, right=0.95, top=0.92, wspace=0.1, hspace=0.1)
-        
-        print("plot_proj_2d")
-        plt.show()
+        plt.subplots_adjust(left=0.05, bottom=0.05, right=0.95, top=0.88, wspace=0.1, hspace=0.1)        
  
         if save_file:
             plt.savefig(save_file, dpi=400)
@@ -489,9 +529,9 @@ class SchisomeDataSet(BaseDataSet):
                 sing = np.count_nonzero(prot_scores[:,k1] > single_thresh)/m
                 dual = np.count_nonzero(prot_scores[:,(k1, k2)].sum(axis=1) > single_thresh)/m
             
-            """
             # For illustrating the process, QC
-            if str(pid) in ('Q8K363'):
+            """
+            if str(pid) in ('F4IFM7',):
                 print(f'* * * * * * * * * * * * * * * * * * *')
                 fig, (ax1, ax2) = plt.subplots(1, 2)
  
@@ -522,7 +562,8 @@ class SchisomeDataSet(BaseDataSet):
                                num_cpu=MAX_CORES, verbose=True, local_cpu_arg=None)
                                 
         p_values1, p_values2, singularity, duality = [np.array(x) for x in zip(*results)]    
-                                
+        
+        duality -= singularity     
 
         is_dbl = (p_values1 > p_lim) & (p_values2 <= p_lim)
         p_values = p_values1.copy()
@@ -548,6 +589,7 @@ class SchisomeDataSet(BaseDataSet):
         mean_scores = pred_class_scores.mean(axis=1)
         
         prediction = np.full(p_values1.shape, -1)
+        prediction1 = np.full(p_values1.shape, -1)
         prediction2 = np.full(p_values1.shape, -1)
         
         for i, scores in enumerate(mean_scores):
@@ -557,9 +599,10 @@ class SchisomeDataSet(BaseDataSet):
             mv2 = scores[k2]
             p1 = p_values1[i]
             p2 = p_values2[i]
+            pred = -1
             
             if (p1 < p_lim) and (mv2 < 0.2): #  or mv1 > 0.5:
-                pred1 = k1
+                pred1 = pred = k1
                 pred2 = -1
  
             elif p2 < p_lim:
@@ -570,8 +613,9 @@ class SchisomeDataSet(BaseDataSet):
                 pred1 = -1
                 pred2 = -1
                 
-            prediction[i] = pred1
+            prediction1[i] = pred1
             prediction2[i] = pred2
+            prediction[i] = pred
             
         klass_labels = self.train_labels + ['UNKNOWN']
         init_profiles = self.train_profiles
@@ -582,7 +626,12 @@ class SchisomeDataSet(BaseDataSet):
         self.set_array_data('novelty', novelty)
         self.set_array_data('completeness', completeness)
         self.set_marker_data('prediction2', prediction2, klass_labels)
+        self.set_marker_data('prediction1', prediction1, klass_labels)
         self.set_marker_data('prediction', prediction, klass_labels)
+        self.set_array_data('log_pval1', np.log10(np.clip(p_values1, 1e-10, None)))
+        self.set_array_data('log_pval2', np.log10(np.clip(p_values2, 1e-10, None)))
+        
+        
 
 
     def make_profile_predictions(self, split_idx=None, max_missing=0.35):
@@ -704,8 +753,12 @@ class SchisomeDataSet(BaseDataSet):
 
         init_profiles = self.get_profile_data('init')
         init_profiles = np.nan_to_num(init_profiles)
-        
         recon_profiles = self.get_profile_data('recon')
+        
+        orig_cols = self.orig_cols
+        init_profiles = init_profiles[:,orig_cols]
+        recon_profiles = recon_profiles[:,orig_cols]
+        
         
         n, m = recon_profiles.shape
         
@@ -741,7 +794,7 @@ class SchisomeDataSet(BaseDataSet):
         self.info(f'{tag} Rows:{n1:,} Cols:{m} Zeros:{pc_recon_zeros:.1f}% Mean Row Non-zero:{mean_valid_nz:.1f} IQR:{q25_valid_nz:.1f}-{q75_valid_nz:.1f} Abs. Recon. error {mean_err:.2f} IQR:{q25:.2f}-{q75:.2f}')
         
     
-    def save_pruned_table(self, tsv_path):
+    def save_pruned_table(self, tsv_path, max_missing=0.35):
         
         marker_idx = self.raw_markers        
         klass_idx = self.train_markers
@@ -750,7 +803,9 @@ class SchisomeDataSet(BaseDataSet):
         
         n, m, k = pred_data.shape
             
-        pvals = self.get_array_data('pval')
+        pvals = self.get_array_data('pval1')
+        completeness = self.get_array_data('completeness')
+
         scores = pred_data.mean(axis=1)     
         sort_idx = scores.argsort(axis=1)
         first    = sort_idx[:,-1]
@@ -761,30 +816,49 @@ class SchisomeDataSet(BaseDataSet):
         title_dict = self.get_prot_titles(pids) 
              
         table_data = []
+        ntrain = 0
+        npruned_same = 0
+        npruned_diff = 0
         
         for i in range(n):
             mk = marker_idx[i]
             tk = klass_idx[i]
+                    
+            miss_frac = 1.0-completeness[i]
+            if miss_frac > max_missing:
+                continue
            
             if mk == -1:
-                    continue
+                 continue
            
             if mk == tk:
-                    continue
-        
+                ntrain += 1
+                continue
+            
             a = first[i]
             b = second[i]
             c = third[i]             
-
-            table_data.append([klass_lbl[mk], klass_lbl[a], scores[i,a], klass_lbl[b], scores[i,b], klass_lbl[c], scores[i,c], pvals[i], pids[i], title_dict[pids[i]]])
+            
+            if klass_lbl[mk] == klass_lbl[a]:
+                npruned_same += 1
+            else:
+                npruned_diff += 1
+            
+            table_data.append([klass_lbl[mk], klass_lbl[a], scores[i,a], klass_lbl[b], scores[i,b], klass_lbl[c], scores[i,c], pvals[i], pids[i], miss_frac, title_dict[pids[i]]])
         
         table_data.sort()
-        table_heads = ['p-value', 'Pruned Marker Label', 'Pred Class 1', 'Score 1', 'Pred Class 2', 'Score 2', 'Pred Class 3', 'Score 3' 'Protein ID', 'Description']
+        table_heads = ['','1-Class p-value', '%Missing', 'Pruned Marker Label', 'Pred Class 1', 'Score 1', 'Pred Class 2', 'Score 2', 'Pred Class 3', 'Score 3', 'Protein ID', 'Description']
         
         with open(tsv_path, 'w') as out_file_obj:
+            out_file_obj.write(f'Max % data missing:\t{100.0*max_missing:.2f}\n')
+            out_file_obj.write(f'Trained markers:\t{ntrain:,}\n')
+            out_file_obj.write(f'Pruned : Same assignment\t{npruned_same:,}\n')
             out_file_obj.write('\t'.join(table_heads) + '\n')
      
-            for mk, k1, s1, k2, s2, k3, s3, p, pid, desc in    table_data:
+            for mk, k1, s1, k2, s2, k3, s3, p, pid, miss, desc in    table_data:
+                if mk != k1:
+                    continue
+                
                 if s3 < 0.05:
                     s3 = ''
                     k3 = ''
@@ -799,9 +873,33 @@ class SchisomeDataSet(BaseDataSet):
                 else:
                     s2 = f'{100.0*s2:.2f}'
                         
-                line = f'{p:.7f}\t{mk}\t{k1}\t{100.0*s1:.2f}\t{k2}\t{s2}\t{k3}\t{s3}\t{pid}\t{desc}\n'
+                line = f'\t{p:.3e}\t{100.0*miss:.2f}\t{mk}\t{k1}\t{100.0*s1:.2f}\t{k2}\t{s2}\t{k3}\t{s3}\t{pid}\t{desc}\n'
                 out_file_obj.write(line)
-                         
+           
+            out_file_obj.write(f'Pruned : Different assignment\t{npruned_diff:,}\n')
+            out_file_obj.write('\t'.join(table_heads) + '\n')
+
+            for mk, k1, s1, k2, s2, k3, s3, p, pid, miss, desc in    table_data:
+                 if mk == k1:
+                     continue
+ 
+                 if s3 < 0.05:
+                     s3 = ''
+                     k3 = ''
+ 
+                 else:
+                     s3 = f'{100.0*s3:.2f}'
+
+                 if s2 < 0.05:
+                     s2 = ''
+                     k2 = ''
+ 
+                 else:
+                     s2 = f'{100.0*s2:.2f}'
+ 
+                 line = f'\t{p:.3e}\t{100.0*miss:.2f}\t{mk}\t{k1}\t{100.0*s1:.2f}\t{k2}\t{s2}\t{k3}\t{s3}\t{pid}\t{desc}\n'
+                 out_file_obj.write(line)
+ 
         self.info(f'Write {len(table_data):,} lines to {tsv_path}')
      
     
@@ -903,13 +1001,42 @@ class SchisomeDataSet(BaseDataSet):
         plt.show()
     
     
-    def plot_overview(self, p1=1e-4, p2=0.1, min_nonzero=0.65, s_thresh=0.8):
+    def plot_duality_vs_completeness(self, save_path=None, min_nonzero=0.5):  
+    
+        completeness = self.get_array_data('completeness')
+        duality = self.get_array_data('duality')
+        
+        valid = completeness > min_nonzero
+        
+        title = self.name
+        
+        fig, ax1 = plt.subplots()
+        fig.set_size_inches(4.0, 4.0)
+        
+        ax1.set_ylabel('Profile Completeness')
+        ax1.set_xlabel('Localisation Dualness')
+        hist, xe, ye, im = ax1.hist2d(duality[valid], completeness[valid], cmap='Blues', bins=20, norm='log')
+        
+        cb1 = fig.colorbar(im, ax=ax1, pad=0.02)
+        cb1.set_label('Count')
+        cb1.ax.tick_params(labelsize=7) 
+        fig.subplots_adjust(left=0.15, bottom=0.15, right=0.95, top=0.95, wspace=0.1, hspace=0.1)
+ 
+        if save_path:
+            plt.savefig(save_path, dpi=400)
+            self.info(f'Saved {save_path}')
+ 
+        else:
+            plt.show()
+         
+         
+    def plot_overview(self, save_path=None, p1=1e-2, p2=0.1, min_nonzero=0.65, s_thresh=0.8):
     
         # Pie chart of % markers, conf, non-conf, missing/unknown
         # Singe prediction p-value ranges
         # p_values, novelty, completeness, p_values1, p_values2, singularity, duality
  
-        title = self.source_tag
+        title = self.name
         
         klass_idx = self.train_markers
         klass_lbl = self.train_labels
@@ -961,15 +1088,17 @@ class SchisomeDataSet(BaseDataSet):
         pcs = [100.0 * x for x in fracs]
         slabels = ['Total','Data deficient','Data sufficient','Classified','Training','Good','Mediocre','Uncertain']
  
-        self.info(f'{title}', end=' ')
+        self.info(f'{title}')
  
         for slabel, count, pc in zip(slabels, counts, pcs):
-                self.info(f'{slabel}:{count:,} ({pc:.1f}%)', end=' ')
+                self.info(f'{slabel}:{count:,} ({pc:.1f}%)')
  
         self.info('')
  
         fig, ax = plt.subplots()
- 
+        fig.set_size_inches(8.0, 8.0)
+        fig.subplots_adjust(left=0.05, bottom=0.05, right=0.95, top=0.95, wspace=0.1, hspace=0.1)
+        
         ax.set_title(title + f' n={n:,}')
  
         labels = ['Trained', f'p < {p1}', f'p [{p1}, {p2}]', f'p > {p2}','Data deficient']
@@ -980,7 +1109,7 @@ class SchisomeDataSet(BaseDataSet):
              pc = 100.0 * vals[i] / float(n)
              labels[i] = f"{l}\nn={vals[i]:,}\n{pc:.2f}%"
  
-        ax.pie(vals, wedgeprops=dict(width=0.4, edgecolor='w'), textprops=dict(color="w"),
+        ax.pie(vals, wedgeprops=dict(width=0.4, edgecolor='w'), textprops=dict(color="w", fontsize=11),
               labeldistance=0.75, radius=1.0, labels=labels, colors=colors)
  
         n_single1 = np.count_nonzero(single & p_gud)
@@ -1019,21 +1148,23 @@ class SchisomeDataSet(BaseDataSet):
         ax.legend([m1, m2, m3], ['Single', 'Double', 'Other'], fontsize=10, loc=10)
         ax.set_axis_off()
  
-        plt.show()
+        #fig, ax = plt.subplots()
+        #ax.hist(pvals1, bins=200)
+        #plt.show()
  
-        fig, ax = plt.subplots()
+        if save_path:
+            plt.savefig(save_path, dpi=400)
+            self.info(f'Saved {save_path}')
  
-        ax.hist(pvals1, bins=200)
- 
-        plt.show()
+        else:
+            plt.show()
  
 
     def plot_dual_localisation_overview(self, p1=1e-4, s_thresh=0.8, min_nonzero=0.65, fontsize=8, save_path=None, tsv_path=None):
     
         #from scipy.cluster import hierarchy
-        #from scipy.spatial import distance
         
-        tag = self.source_tag
+        tag = self.name
         
         cmap = LinearSegmentedColormap.from_list(name='CMAP01', colors=['#FFFFFF', '#4080FF'], N=25)
         cmap.set_bad('#DDDDCD', 1.0)
@@ -1168,19 +1299,32 @@ class SchisomeDataSet(BaseDataSet):
             plt.show()
  
  
-    def plot_pr_curve(self):
+    def plot_pr_curve(self, tag, use_svm=False, pruned_markers=False, save_path=None):       
                 
         klass_labels = self.train_labels
-        true_klasses = self.train_markers
+        true_klasses = self.train_markers if pruned_markers else self.raw_markers
         
         # 0 index is not used in trainaing, > 0 reflects leave-chunk-out group, e.g. 1 - 10
         partition_idx = self.train_groups
-        
         n = int(max(partition_idx))
         
-        scores = self.class_ensemble_preds    
+        if use_svm:
+            try:
+                self._check_pred_class_key(self._pred_svm_key)
+ 
+            except ChoragraphException as err:
+                self.svm_fit_predict()
+                
+            scores = self.class_ensemble_preds_svm
+            src = 'SVM'
+        else:
+            scores = self.class_ensemble_preds    
+            src = 'DNN'
         
-        predictions = scores[:,:,:len(klass_labels)]
+        title = f'{self.name} {src}'
+        pruned = 'excludes' if pruned_markers else 'includes'
+        
+        predictions = scores[:,:,:len(klass_labels)] # trims nulls
         
         prots, m, n_klasses = predictions.shape
         
@@ -1273,7 +1417,7 @@ class SchisomeDataSet(BaseDataSet):
             
             marker_count = np.count_nonzero(true_klasses == k)
             
-            label = f'{klass} F$_1$={f1:.3f} k={marker_count:,}'
+            label = f'{klass} [{marker_count:,}] F$_1$={f1:.3f}'
             ax.plot(recalls, precisions, label=label, alpha=0.4, linewidth=2, color=color)
             ax.scatter([recall_05], [precision_05], s=40, color=color, marker='*', zorder=9)
             ax.scatter([recall_05], [precision_05], s=5, color='k', marker='*', zorder=90)
@@ -1287,71 +1431,118 @@ class SchisomeDataSet(BaseDataSet):
         
         macro_f1s = np.array(klass_f1s)
         
-        title = f'Macro F$_1$ = {macro_f1s.mean():.3f} \u00B1 {macro_f1s.std():.3f} ($n=${len(macro_f1s):,})'
+        info = f'Test {pruned} pruned labels. Macro F$_1$ = {macro_f1s.mean():.3f} \u00B1 {macro_f1s.std():.3f} ($k=${len(macro_f1s):,})'
         
-        ax.set_title(title)
+        ax.set_title(title, fontsize=14, loc='left', fontweight="bold")
+        ax.text(0.50, 0.97, info, transform=fig.transFigure, color='#888888', fontsize=9, ha='center', va='top', )
         
-        plt.show()
+        if save_path:
+            plt.savefig(save_path, dpi=400)
+            self.info(f'Saved {save_path}')
+        
+        else:        
+            plt.show()
+         
             
-
-    def plot_contingency_table(self, marker_label, pred_label=None, marker_title='Training Class', pred_title='Predicted Class', 
-                               save_path=None, fontsize=8):
-
+    
+    def plot_duals_analysis(self, tag, save_path=None, table_path=None, fontsize=8, p_lim=1e-3, min_nonzero=0.65, min_frac=0.2, alt_method='alt_method'):
+        
+        compare_classes = self.get_marker_data(self.comparison_markers_key)
+         
         cmap = LinearSegmentedColormap.from_list(name='CMAP01', colors=['#FFFFFF', '#4080FF'], N=25)
         cmap.set_bad('#DDDDCD', 1.0)
+         
+        class_labels = set(self.train_labels) - set(['unknown','DUAL'])
+        class_labels = sorted(class_labels)
+        n = len(class_labels)               
+        idx = {x:i for i, x in enumerate(class_labels)}
         
-        if pred_label:
-            pred_labels = self.get_marker_labels(pred_label)
-        else:
-            pred_labels = self.train_labels
-        
-        
-        marker_labels = self.get_marker_labels(marker_label)
-        
-        all_labels = set(pred_labels) & set(marker_labels) - set(['unknown','DUAL'])
-        all_labels = sorted(all_labels) + ['undefined']
-        u = len(all_labels) - 1
-        
-        idx = {x:i for i, x in enumerate(all_labels)}
-        markers = self.get_marker_data(marker_label)
-        
-        if pred_label:
-            predictions = self.get_marker_data(pred_label)
-        else:     
-            predictions = self.class_ensemble_preds.mean(axis=1).argmax(axis=-1)
-        
+        mean_scores = self.class_ensemble_preds.mean(axis=1)
+
         # Map separate to common idx ; old to new
-        map_pred_idx    = {i:idx[x] for i, x in enumerate(pred_labels)}
-        map_marker_idx = {i:idx[x] for i, x in enumerate(marker_labels)}
-        map_pred_idx[1+len(pred_labels)] = u
-        map_marker_idx[1+len(marker_labels)] = u
-        map_pred_idx[len(pred_labels)] = u
-        map_marker_idx[len(marker_labels)] = u
+        map_pred_idx  = {i:idx[x] for i, x in enumerate(self.train_labels)}
 
-        valid = (markers >= 0) | (predictions >= 0)
-        
-        markers = markers[valid]
-        predictions = predictions[valid]
-        
-        markers[markers < 0] = u
-        predictions[predictions < 0] = u
-
-        n = u + 1
         matrix = np.zeros((n,n), float)
         
-        # Paired indices
-        for j, k in zip(markers, predictions):
-            a = map_marker_idx[j]
-            b = map_pred_idx[k]
-            matrix[a,b] += 1
+        # Find indices of top two
+        p_values1 = self.get_array_data('pval1')
+        p_values2 = self.get_array_data('pval2')
+        pids = self.proteins
+        completeness = self.get_array_data('completeness')
+        top_duals = defaultdict(list)
         
+        for i, scores in enumerate(mean_scores):
+            best_first = scores.argsort()[::-1]
+            k1, k2 = best_first[:2]
+            mv1 = scores[k1]
+            mv2 = scores[k2]
+            p1 = p_values1[i]
+            p2 = p_values2[i]
+            
+            # Skip unknowns : only show concrete classes
+            if k1 >= n:
+               continue
+
+            if k2 >= n:
+               continue
+            
+            if completeness[i] < min_nonzero:
+                continue
+
+            if (p1 < p_lim): #  and (mv2 < 0.2): #  or mv1 > 0.5:
+                # single
+                a = map_pred_idx[k1]
+                matrix[a,a] += 1
+ 
+            elif (p2 < p_lim) and (mv2 > min_frac):
+                # dual
+                a = map_pred_idx[k1]
+                b = map_pred_idx[k2]
+                matrix[a,b] += 1
+                
+                c1 = class_labels[a]
+                c2 = class_labels[b]
+                
+                if c1 > c2:
+                   c2, c1 = c1, c2
+                   mv2, mv1 = mv1, mv2
+                
+                key = f'{c1}:{c2}'
+                insort(top_duals[key], (mv1, mv2, p2, pids[i], class_labels[compare_classes[i]]))
+ 
+ 
+        if table_path:
+            title_dict = self.get_prot_titles(pids)
+                                
+        
+            with open(table_path, 'w') as out_file_obj:
+                write = out_file_obj.write
+                write(f'Dual loc candidates for {tag}.\tMax p-val:{p_lim}.\tMin data:{100*min_nonzero}%\tMin share:{100.0*min_frac}%\n')
+                
+                for key in sorted(top_duals):
+                    #top_duals[key].sort()
+                    c1, c2 = key.split(':')
+                    write(f'{key}\n')
+                    write(f'\tUniProtID\t% {c1}\t% {c2}\tdual_p-val\tgene_name\tdescriptiona\t{alt_method}_class\n')
+                    for mv1, mv2, pval, pid, other_pred in top_duals[key]:
+                        title = title_dict.get(pid, f'{pid} : Unknown')
+                        gene_name, description = title.split(' : ')
+                        line = f'\t{pid}\t{100.0*mv1:.2f}\t{100.0*mv2:.2f}\t{pval:.2e}\t{gene_name}\t{description}\t{other_pred}\n'
+                        write(line)
+ 
+            self.info(f'Wrote {table_path}')
+           
+        ncomp = np.nansum(matrix)
+        single = np.nansum(np.diag(matrix))
+        duality = 100.0 * (ncomp - single)/float(ncomp)
+                
         fig, ax = plt.subplots()
-        fig.subplots_adjust(left=0.17, bottom=0.17, right=0.93, top=0.93, wspace=0.1, hspace=0.1)        
+        fig.subplots_adjust(left=0.17, bottom=0.17, right=0.90, top=0.90, wspace=0.1, hspace=0.1)        
         fig.set_size_inches(7.0, 7.0)
         
         m = np.log10(matrix.max()) 
         for j in range(n):
-             a = map_marker_idx[j]
+             a = map_pred_idx[j]
             
              for k in range(n):
                  b = map_pred_idx[k]
@@ -1364,18 +1555,381 @@ class SchisomeDataSet(BaseDataSet):
                  else:
                      matrix[a,b] = np.nan
         
-        totl = np.nansum(matrix)
-        same = np.nansum(np.diag(matrix))
-        diff = totl - same
-        
-        identity = 100.0 * diff/float(totl)
         
         img = ax.imshow(matrix.T, cmap=cmap, origin='lower')
         
         xtick_pos = np.arange(n)
         ytick_pos = np.arange(n)
         
-        ax.set_title(f'{identity:.1}% same', loc='right')
+        ax.set_title(self.name, fontsize=14, loc='left', fontweight="bold")
+        ax.text(0.90, 0.97, f'Max p-value:{p_lim}\nDual localised:{duality:.1f}%',
+                transform=fig.transFigure, color='#888888', fontsize=9,
+                ha='right', va='top', )
+        
+        ax.set_xticks(xtick_pos)
+        ax.set_yticks(ytick_pos)
+        
+        ax.set_xticklabels(class_labels, rotation=90, fontsize=fontsize)
+        ax.set_yticklabels(class_labels, fontsize=fontsize)
+        
+        ax.xaxis.set_label_position("top")
+        ax.yaxis.set_label_position("right")
+        
+        ax.set_xlabel('Primary location', color='#555555', fontsize=12, va="bottom")
+        ax.set_ylabel('Secondary location', color='#555555', fontsize=12, rotation=270, va="bottom")
+        
+        if save_path:
+            plt.savefig(save_path, dpi=400)
+            self.info(f'Saved {save_path}')
+        
+        else:        
+            plt.show()
+         
+
+
+    def plot_duals_contingency_table(self, marker_label, marker_title='Comparison Class', pred_title='Dual Class Prediction', 
+                                     save_path=None, fontsize=8, use_undef=False, max_missing=0.2):
+
+        cmap = LinearSegmentedColormap.from_list(name='CON_TAB', colors=['#FFFFFF', '#4080FF'], N=25)
+        cmap.set_bad('#DDDDCD', 1.0)
+        
+        pred_labels = self.get_marker_labels('prediction')
+
+        input_data = self.train_profiles
+        invalid = np.count_nonzero(np.isnan(input_data), axis=-1) > int(max_missing*input_data.shape[1])
+        
+        marker_labels = self.get_marker_labels(marker_label)
+        
+        all_labels = set(pred_labels) & set(marker_labels) - set(['unknown','DUAL','UNKNOWN'])
+        all_labels = sorted(all_labels) + ['undefined']
+        u = len(all_labels) - 1
+
+        idx = {x:i for i, x in enumerate(all_labels)}
+        markers = self.get_marker_data(marker_label)
+        
+        pred_idx =  self.class_ensemble_preds.mean(axis=1).argsort()
+        predictions1 = pred_idx[:,-1]
+        predictions2 = pred_idx[:,-2]
+        
+        # Map separate to common idx ; old to new
+        map_pred_idx   = {i:idx.get(x, u) for i, x in enumerate(pred_labels)}
+        map_marker_idx = {i:idx.get(x, u) for i, x in enumerate(marker_labels)}
+
+        valid = (markers >= 0) & (self.get_marker_data('prediction2') >= 0) # Where there are DNN duals and an other prediction
+        markers = markers[valid]
+        predictions1 = predictions1[valid]
+        predictions2 = predictions2[valid]
+        invalid = invalid[valid]
+        
+        markers[markers < 0] = u
+        predictions1[predictions2 < 0] = u
+        predictions1[predictions2 < 0] = u
+
+        n = u + 1
+        matrix1 = np.zeros((n,n), float)
+        matrix2 = np.zeros((n,n), float)
+        
+        # Paired indices
+        
+        for i, (j, k) in enumerate(zip(markers, predictions1)):
+            if invalid[i]:
+                continue
+            
+            b = map_marker_idx.get(int(j), u)
+            a = map_pred_idx.get(int(k), u)
+            
+            matrix1[a,b] += 1
+
+        for i, (j, k) in enumerate(zip(markers, predictions2)):
+            if invalid[i]:
+                continue
+            
+            b = map_marker_idx.get(int(j), u)
+            a = map_pred_idx.get(int(k), u)
+            
+            matrix2[a,b] += 1
+        
+        if not use_undef:
+           n -= 1
+           matrix1 = matrix[:-1,:-1]
+           matrix2 = matrix[:-1,:-1]
+           all_labels = all_labels[:-1]
+        
+        totl = np.nansum(matrix1)
+        same = np.nansum(np.diag(matrix1))
+        diff1 = totl - same
+        diff1 = 100.0 * diff1/float(totl)
+        
+        totl = np.nansum(matrix2)
+        same = np.nansum(np.diag(matrix2))
+        diff2 = totl - same
+        diff2 = 100.0 * diff2/float(totl)
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2)
+        fig.subplots_adjust(left=0.1, bottom=0.17, right=0.90, top=0.92, wspace=0.02, hspace=0.1)        
+        fig.set_size_inches(14.0, 7.0)
+        
+        m1 = np.log10(matrix1.max())
+        m2 = np.log10(matrix2.max())
+        for a in range(n):
+              for b in range(n):
+ 
+                 if matrix1[a,b] > 0:
+                     v = np.log10(matrix1[a,b])
+                     color = '#FFFFFF' if (v/m1) > 0.55 else '#000000'
+                     t = ax1.text(a, b, int(matrix1[a,b]), color=color, va='center', ha='center', fontsize=9)
+                     matrix1[a,b] = v
+                 else:
+                     matrix1[a,b] = np.nan
+
+                 if matrix2[a,b] > 0:
+                     v = np.log10(matrix2[a,b])
+                     color = '#FFFFFF' if (v/m2) > 0.55 else '#000000'
+                     t = ax2.text(a, b, int(matrix2[a,b]), color=color, va='center', ha='center', fontsize=9)
+                     matrix2[a,b] = v
+                 else:
+                     matrix2[a,b] = np.nan
+        
+        xtick_pos = np.arange(n)
+        ytick_pos = np.arange(n)
+         
+        ax1.imshow(matrix1.T, cmap=cmap, origin='lower')
+        ax2.imshow(matrix2.T, cmap=cmap, origin='lower')
+       
+        ax1.set_xlabel(f'Primary {marker_title}', fontsize=14, va="bottom")
+        ax2.set_xlabel(f'Secondary {marker_title}', fontsize=14, va="bottom")
+         
+        ax1.set_title(f'Difference {diff1:.1f}%', loc='right', color='#808080', fontsize=9)
+        ax2.set_title(f'Difference {diff2:.1f}%', loc='right', color='#808080', fontsize=9)
+        
+        ax2.set_ylabel(pred_title, fontsize=14) # , va="bottom")
+        
+        ax2.tick_params(right=True, labelright=True, left=False, labelleft=False)
+
+        
+        for ax in (ax1, ax2):
+
+           ax.set_xticks(xtick_pos)
+           ax.set_yticks(ytick_pos)
+ 
+           ax.set_xticklabels(all_labels, rotation=90, fontsize=fontsize)
+           ax.set_yticklabels(all_labels, fontsize=fontsize)
+  
+           ax.xaxis.set_label_position("top") 
+        
+        if save_path:
+            plt.savefig(save_path, dpi=400)
+            self.info(f'Saved {save_path}')
+        
+        else:        
+            plt.show()
+            
+            
+    def plot_confusion_matrix(self, marker_label, marker_title='Training Class', pred_title='Predicted Class', 
+                              use_svm=False, save_path=None, fontsize=8, use_undef=False, max_missing=0.2):
+
+        cmap = LinearSegmentedColormap.from_list(name='CON_TAB', colors=['#FFFFFF', '#4080FF'], N=25)
+        cmap.set_bad('#DDDDCD', 1.0)
+        
+        pred_labels = self.train_labels
+        partition_idx = self.train_groups
+        n_models = int(max(partition_idx))
+
+        input_data = self.train_profiles
+        invalid = np.count_nonzero(np.isnan(input_data), axis=-1) > int(max_missing*input_data.shape[1])
+        
+        marker_labels = self.get_marker_labels(marker_label)
+        
+        all_labels = set(pred_labels) & set(marker_labels) - set(['unknown','DUAL','UNKNOWN'])
+        all_labels = sorted(all_labels) + ['undefined']
+        u = len(all_labels) - 1
+
+        idx = {x:i for i, x in enumerate(all_labels)}
+        markers = self.get_marker_data(marker_label)
+        
+        
+        if use_svm:
+            try:
+                self._check_pred_class_key(self._pred_svm_key)
+ 
+            except ChoragraphException as err:
+                self.svm_fit_predict()
+                
+            ensemble_preds = self.class_ensemble_preds_svm
+        else:
+            ensemble_preds = self.class_ensemble_preds
+           
+        predictions = ensemble_preds.mean(axis=1).argmax(axis=-1)
+        
+        # Map separate to common idx ; old to new
+        map_pred_idx   = {i:idx.get(x, u) for i, x in enumerate(pred_labels)}
+        map_marker_idx = {i:idx.get(x, u) for i, x in enumerate(marker_labels)}
+
+        valid = (markers >= 0) | (predictions >= 0)
+        markers = markers[valid]
+        predictions = predictions[valid]
+        invalid = invalid[valid]
+        
+        markers[markers < 0] = u
+        predictions[predictions < 0] = u
+
+        n = u + 1
+        matrix = np.zeros((n,n), float)
+        
+        # Paired indices
+        
+        weight = 1.0/n_models
+        for i, j in enumerate(markers):
+            if invalid[i]:
+                continue
+            
+            a = map_marker_idx.get(int(j), u)
+            m = int(partition_idx[i]) - 1 # Model when used as a test point
+
+            k = ensemble_preds[i,m].argmax()
+            b = map_pred_idx.get(k, u)
+ 
+            matrix[a,b] += 1
+        
+        if not use_undef:
+           n -= 1
+           matrix = matrix[:-1,:-1]
+           all_labels = all_labels[:-1]
+        
+        totl = np.nansum(matrix)
+        same = np.nansum(np.diag(matrix))
+        diff = totl - same
+        diff = 100.0 * diff/float(totl)
+        
+        fig, ax = plt.subplots()
+        fig.subplots_adjust(left=0.17, bottom=0.17, right=0.93, top=0.93, wspace=0.1, hspace=0.1)        
+        fig.set_size_inches(7.0, 7.0)
+        
+        m = np.log10(matrix.max())
+        for a in range(n):
+              for b in range(n):
+ 
+                 if matrix[a,b] > 0:
+                     v = np.log10(matrix[a,b])
+                     color = '#FFFFFF' if (v/m) > 0.55 else '#000000'
+                     t = ax.text(a, b, int(matrix[a,b]), color=color, va='center', ha='center', fontsize=9)
+                     matrix[a,b] = v
+                 else:
+                     matrix[a,b] = np.nan
+        
+        img = ax.imshow(matrix.T, cmap=cmap, origin='lower')
+        
+        xtick_pos = np.arange(n)
+        ytick_pos = np.arange(n)
+        
+        ax.set_title(f'Difference {diff:.1f}%', loc='right', color='#808080')
+        
+        ax.set_xticks(xtick_pos)
+        ax.set_yticks(ytick_pos)
+        
+        ax.set_xticklabels(all_labels, rotation=90, fontsize=fontsize)
+        ax.set_yticklabels(all_labels, fontsize=fontsize)
+        
+        ax.xaxis.set_label_position("top")
+        ax.yaxis.set_label_position("right")
+        
+        ax.set_xlabel(marker_title, fontsize=14, va="bottom")
+        ax.set_ylabel(pred_title, fontsize=14, rotation=270, va="bottom")
+        
+        if save_path:
+            plt.savefig(save_path, dpi=400)
+            self.info(f'Saved {save_path}')
+        
+        else:        
+            plt.show()
+
+
+    def plot_contingency_table(self, marker_label, pred_label=None, marker_title='Training Class', pred_title='Predicted Class', 
+                               save_path=None, fontsize=8, use_undef=False, max_missing=0.2):
+
+        cmap = LinearSegmentedColormap.from_list(name='CON_TAB', colors=['#FFFFFF', '#4080FF'], N=25)
+        cmap.set_bad('#DDDDCD', 1.0)
+        
+        if pred_label:
+            pred_labels = self.get_marker_labels(pred_label)
+        else:
+            pred_labels = self.train_labels
+        
+        input_data = self.train_profiles
+        invalid = np.count_nonzero(np.isnan(input_data), axis=-1) > int(max_missing*input_data.shape[1])
+        
+        marker_labels = self.get_marker_labels(marker_label)
+        
+        all_labels = set(pred_labels) & set(marker_labels) - set(['unknown','DUAL','UNKNOWN'])
+        all_labels = sorted(all_labels) + ['undefined']
+        u = len(all_labels) - 1
+
+        idx = {x:i for i, x in enumerate(all_labels)}
+        markers = self.get_marker_data(marker_label)
+        
+        if pred_label:
+            predictions = self.get_marker_data(pred_label)
+        else:     
+            predictions = self.class_ensemble_preds.mean(axis=1).argmax(axis=-1)
+        
+        # Map separate to common idx ; old to new
+        map_pred_idx   = {i:idx.get(x, u) for i, x in enumerate(pred_labels)}
+        map_marker_idx = {i:idx.get(x, u) for i, x in enumerate(marker_labels)}
+
+        valid = (markers >= 0) | (predictions >= 0)
+        markers = markers[valid]
+        predictions = predictions[valid]
+        invalid = invalid[valid]
+        
+        markers[markers < 0] = u
+        predictions[predictions < 0] = u
+
+        n = u + 1
+        matrix = np.zeros((n,n), float)
+        
+        # Paired indices
+        
+        for i, (j, k) in enumerate(zip(markers, predictions)):
+            if invalid[i]:
+                continue
+            
+            a = map_marker_idx.get(int(j), u)
+            b = map_pred_idx.get(int(k), u)
+            
+            matrix[a,b] += 1
+        
+        if not use_undef:
+           n -= 1
+           matrix = matrix[:-1,:-1]
+           all_labels = all_labels[:-1]
+        
+        totl = np.nansum(matrix)
+        same = np.nansum(np.diag(matrix))
+        diff = totl - same
+        diff = 100.0 * diff/float(totl)
+        
+        fig, ax = plt.subplots()
+        fig.subplots_adjust(left=0.17, bottom=0.17, right=0.93, top=0.93, wspace=0.1, hspace=0.1)        
+        fig.set_size_inches(7.0, 7.0)
+        
+        m = np.log10(matrix.max())
+        for a in range(n):
+              for b in range(n):
+ 
+                 if matrix[a,b] > 0:
+                     v = np.log10(matrix[a,b])
+                     color = '#FFFFFF' if (v/m) > 0.55 else '#000000'
+                     t = ax.text(a, b, int(matrix[a,b]), color=color, va='center', ha='center', fontsize=9)
+                     matrix[a,b] = v
+                 else:
+                     matrix[a,b] = np.nan
+        
+        img = ax.imshow(matrix.T, cmap=cmap, origin='lower')
+        
+        xtick_pos = np.arange(n)
+        ytick_pos = np.arange(n)
+        
+        ax.set_title(f'Difference {diff:.1f}%', loc='right', color='#808080')
         
         ax.set_xticks(xtick_pos)
         ax.set_yticks(ytick_pos)
@@ -1473,11 +2027,11 @@ class SchisomeDataSet(BaseDataSet):
             plt.show()
     
 
-    def plot_ave_profiles(self, marker_label, replica=0, save_paths='png/ave_profile_{}.png', min_nonzero=0.8):
+    def plot_ave_profiles(self, marker_label, replica=0, save_path=None, min_nonzero=0.8):
         
         self._check_marker_key(marker_label)
 
-        prof_data = self.train_profiles
+        prof_data = self.train_profiles[:,self.orig_cols]
  
         #self.info(f'Data size for "{prof_label}": {prof_data.shape}')
  
@@ -1485,28 +2039,34 @@ class SchisomeDataSet(BaseDataSet):
  
         klasses = self.get_marker_data(marker_label)[valid]
         labels = self.get_marker_labels(marker_label)
+        sort_labels = sorted([(label, k) for k, label in enumerate(labels)])
+        
+        replica_widths = np.array(self.replica_cols)
+        replica_starts = np.cumsum([0] + self.replica_cols)
+        replica_ends = replica_starts[:-1] + replica_widths
+        
+        replica_data = prof_data[valid,replica_starts[replica]:replica_ends[replica]-1]
+        #replica_data = prof_data[valid]
  
-        replica_widths = self.replica_cols
- 
-        replica_starts = np.cumsum([0] + replica_widths)
-        replica_ends = replica_starts + replica_widths
-        replica_data = prof_data[valid,replica_starts[replica]:replica_ends[replica]]
- 
-        x_vals = np.arange(1, replica_widths[replica]+1)
- 
+        #x_vals = np.arange(1, replica_widths[replica])
+        x_vals = np.arange(1, replica_data.shape[1]+1)
         #plt.style.use('dark_background')
  
         npanels = len(labels)
-        ncols = 3
+        ncols = 4
         nrows = int(math.ceil(npanels/float(ncols)))
- 
-        fig, axarr = plt.subplots(nrows, ncols)
-        fig.set_size_inches(10.0, 8.0)
-        fig.subplots_adjust(left=0.08, bottom=0.08, right=0.95, top=0.95, wspace=0.15, hspace=0.3)
- 
-        for k, label in enumerate(labels):
-            row = k % nrows
-            col = k // nrows
+        
+        mat = np.zeros((len(sort_labels), len(x_vals)))
+        cmap = LinearSegmentedColormap.from_list(name='CMAP01', colors=['#FFFFFF', '#FF0000', '#000000'], N=25)
+         
+        fig, axarr = plt.subplots(nrows, ncols, sharey=True)
+        fig.set_size_inches(10.0, 7.0)
+        fig.subplots_adjust(left=0.08, bottom=0.08, right=0.95, top=0.92, wspace=0.05, hspace=0.3)
+        fig.suptitle(f'Median Profiles Replica Exp {replica+1}', fontsize=12)
+        
+        for i, (label, k) in enumerate(sort_labels):
+            row = i % nrows
+            col = i // nrows
             ax = axarr[row, col]
  
             idx = (klasses == k).nonzero()[0]
@@ -1520,39 +2080,73 @@ class SchisomeDataSet(BaseDataSet):
             color = COLOR_DICT[label]
             ax.fill_between(x_vals, lower, upper, color=color, alpha=0.3, label='IQR')
 
-            ax.plot(x_vals, median, color=color, linewidth=2, label=f'Median')
-            ax.set_title(f'Average Profile : {label} (n={len(klass_data):,})', fontsize=9, color=color)
+            ax.plot(x_vals, median, color=color, linewidth=1, label=f'Median')
+            print('# #', x_vals, len(median))
+            ax.set_title(f'{label} (n={len(klass_data):,})', fontsize=9, color=color)
  
-            if (k == npanels -1 ) or (row == nrows-1):
-                ax.set_xlabel('MS Fraction')
+            if (i == npanels -1 ) or (row == nrows-1):
+                ax.set_xlabel('Gradient sample')
  
             if col == 0:
                 ax.set_ylabel('Rel. abundance')
  
  
-            if (row < nrows-1) and (k < len(labels)-1):
+            if (row < nrows-1) and (i < len(labels)-1):
                 ax.set_xticklabels([])
  
             ax.legend(fontsize=7, framealpha=0.2)
             ax.tick_params(axis='both', which='both', labelsize=8)
- 
-            if save_paths:
-                save_path = save_paths.format(label)
-                plt.savefig(save_path, dpi=200)
-                self.info(f'Saved {save_path}')
-                plt.close()
- 
-        k += 1
-        while k < nrows * ncols:
-            ax = axarr[k % nrows, k // nrows]
+            
+            mat[i] = median
+
+        corr_mat2 = distance.pdist(mat.T, metric='correlation')
+        linkage2 = hierarchy.ward(corr_mat2)
+        order2 = hierarchy.leaves_list(linkage2)
+        mat = mat[:,order2]
+
+        corr_mat = distance.pdist(mat, metric='correlation')
+        linkage = hierarchy.ward(corr_mat)
+        order = hierarchy.leaves_list(linkage)
+        mat = mat[order]
+            
+        fig1, ax1 = plt.subplots()
+        fig1.set_size_inches(8.0, 6.0)
+        fig1.subplots_adjust(left=0.1, bottom=0.1, right=0.95, top=0.95, wspace=0.05, hspace=0.3)
+        im = ax1.imshow(mat, cmap=cmap)
+        
+        ax1.set_title(f'Median Profiles Replica Exp {replica+1}', fontsize=12)
+        ax1.set_xlabel('Gradient samples')
+        
+        xticks = np.arange(len(x_vals))
+        ax1.set_xticks(xticks)
+        ax1.set_xticklabels(1+xticks)
+        ax1.set_yticks(np.arange(len(sort_labels)))
+        ax1.set_yticklabels([sort_labels[x][0] for x in order])
+  
+        cb1 = fig.colorbar(im, ax=ax1, pad=0.02)
+        cb1.set_label('Relative abundance')
+        cb1.ax.tick_params(labelsize=9) 
+        
+        i += 1
+        while i < nrows * ncols:
+            ax = axarr[i % nrows, i // nrows]
             ax.set_axis_off()
-            k += 1
+            i += 1
  
-        if not save_paths:
+        if save_path:
+            fig.savefig(save_path, dpi=200)
+            self.info(f'Saved {save_path}')
+            file_root, file_ext = os.path.splitext(save_path)
+            save_path1 = f'{file_root}_comb{file_ext}'
+            fig1.savefig(save_path1, dpi=200)
+            self.info(f'Saved {save_path1}')
+            plt.close()
+        
+        else:
             plt.show()
 
     
-    def plot_prediction_scatter(self, n_cols=2, protein_ids=None, save_paths='png/class_scores_{}_{:03d}.png'):
+    def plot_prediction_scatter(self, n_cols=2, plot_size=4, protein_ids=None, save_paths='png/class_scores_{}_{:03d}.png'):
 
         def _make_score_plot(ax, title, score_data, labels, col):
 
@@ -1653,7 +2247,7 @@ class SchisomeDataSet(BaseDataSet):
  
  
                 fig, axarr = plt.subplots(n_rows, n_cols)
-                fig.set_size_inches(5.0 * n_rows, 6.0 * n_cols)
+                fig.set_size_inches(plot_size * n_rows, (1.0 +plot_size) * n_cols)
  
                 for j in range(step):
                     k = i + j
@@ -1667,7 +2261,7 @@ class SchisomeDataSet(BaseDataSet):
                     else:
                         axarr[row, col].set_axis_off()
 
-                fig.subplots_adjust(left=0.1, bottom=0.12, right=0.95, top=0.95, wspace=0.1, hspace=0.34)
+                fig.subplots_adjust(left=0.1, bottom=0.12, right=0.95, top=0.95, wspace=0.15, hspace=0.4)
  
                 if save_paths:
                     save_path = save_paths.format(key, i)
@@ -1683,10 +2277,12 @@ class SchisomeDataSet(BaseDataSet):
     def plot_reconstruction(self, save_path=None, ncols=5):
 
         pids = self.proteins
+        orig_cols = self.orig_cols
  
-        recon_profile_data = self.recon_profiles
-        ref_profile_data = self.train_profiles
+        recon_profile_data = self.recon_profiles[:,orig_cols]
+        ref_profile_data = self.train_profiles[:,orig_cols]
         ref_profile_data[ref_profile_data == 0.0] = np.nan
+       
         n, p = ref_profile_data.shape
  
         z = np.count_nonzero(np.isnan(ref_profile_data), axis=1)
@@ -1703,7 +2299,7 @@ class SchisomeDataSet(BaseDataSet):
             t2 = t + step
             selection = ((z >= t1) & (z < t2)).nonzero()[0]
         
-            if len(selection): # ONly have a row if there's something to show
+            if len(selection): # Only have a row if there's something to show
                 np.random.shuffle(selection)
                 valid.append(selection[:ncols])
                 row_tags.append(f'{t1}-{t2-1}')
@@ -1713,10 +2309,18 @@ class SchisomeDataSet(BaseDataSet):
                 break
  
         valid = np.concatenate(valid)
-  
+        
         recon_profile_data = recon_profile_data[valid]
         ref_profile_data = ref_profile_data[valid]
+         
+        #ref_profile_data /= np.nanmean(ref_profile_data, axis=1)[:,None]
+        #recon_profile_data /= np.nanmean(recon_profile_data, axis=1)[:,None]
  
+        #fig, (ax1, ax2) = plt.subplots(1,2)
+        #ax1.hist(ref_profile_data.ravel(), bins=100)
+        #ax2.hist(recon_profile_data.ravel(), bins=100)
+        #plt.show()
+        
         #recon_profile_data -= np.nanmin(recon_profile_data, axis=1)[:,None]
         #recon_profile_data /= np.nanmean(recon_profile_data, axis=1)[:,None]
         #recon_profile_data *= np.nanmean(ref_profile_data, axis=1)[:,None]
@@ -1729,7 +2333,8 @@ class SchisomeDataSet(BaseDataSet):
         #plt.style.use('dark_background')
  
         fig1, axarr = plt.subplots(nrows, ncols)
- 
+        fig1.set_size_inches(18.0, 12.0)
+        
         for i, pid in enumerate(pids):
             col = i % ncols
             row = i // ncols
@@ -1741,7 +2346,8 @@ class SchisomeDataSet(BaseDataSet):
                 ax.set_ylabel(f'Original ({row_tags[row]} missing)')
             ax.set_title(title_dict[pid], fontsize=9)
 
-        fig2, axarr2 = plt.subplots(nrows, ncols)
+        fig2, axarr2 = plt.subplots(nrows, ncols, sharex=True, sharey=True)
+        fig2.set_size_inches(8.0, 8.0)
  
         blank = np.array([float('nan')] * p)
  
@@ -1753,8 +2359,8 @@ class SchisomeDataSet(BaseDataSet):
             x_vals = np.arange(1, p+1)
  
             recon_profile = recon_profile_data[i]
- 
             orig_profile = ref_profile_data[i]
+            
             missing = np.nonzero(np.isnan(orig_profile))[0]
             ms = set(missing)
             extra = set()
@@ -1770,26 +2376,34 @@ class SchisomeDataSet(BaseDataSet):
             fill_profile[extra] = orig_profile[extra]
             fill_profile[missing] = recon_profile[missing]
  
-            ax.plot(x_vals, recon_profile, color='#000000', alpha=0.9, linewidth=1, linestyle='--', label='Recon')
-            ax.plot(x_vals, orig_profile, color='#0080FF', alpha=0.5, linewidth=2, label='Original')
-            ax.plot(x_vals, fill_profile, color='#BBBB00', alpha=0.5, linewidth=2, label='Added')
- 
+            ax.plot(x_vals, recon_profile, color='#0080FF', alpha=0.7, linewidth=1, label='Denoised')
+            ax.plot(x_vals, orig_profile,  color='#000000', alpha=0.3, linewidth=1)
+            ax.plot(x_vals, fill_profile,  color='#FF0000', alpha=0.3, linewidth=2)
+
+            nans = np.isnan(orig_profile)
+            recon_profile[~nans] = np.nan
+            ax.scatter(x_vals, recon_profile, color='#FF0000', alpha=0.7, label='Reconstructed', s=5)
+            ax.scatter(x_vals, orig_profile,  color='#000000', alpha=0.7, label='Original', s=5)
+            ax.tick_params(axis='both', labelsize=7)
+            
             if col == 0:
-                ax.set_ylabel(f'Abundance ({row_tags[row]} missing)')
+                ax.set_ylabel(f'Abundance ({row_tags[row]} missing)', fontsize=9)
             if row == nrows-1:
-                ax.set_xlabel('Fraction')
+                ax.set_xlabel('Gradient sample', fontsize=9)
  
             title = title_dict[pid]
             if len(title) > 64:
-                fontsize = 8 * (64.0/len(title))
+                fontsize = 5 * (64.0/len(title))
             else:
-                fontsize = 8
+                fontsize = 5
  
             ax.set_title(title, fontsize=fontsize)
-            ax.legend(fontsize=8, framealpha=0.2)
+            
+            if (col == 0) and (row == 0):
+               ax.legend(fontsize=7, framealpha=0.5)
  
-        fig1.subplots_adjust(left=0.05, bottom=0.05, right=0.95, top=0.95, wspace=0.1, hspace=0.25)
-        fig2.subplots_adjust(left=0.05, bottom=0.05, right=0.95, top=0.95, wspace=0.1, hspace=0.25)
+        fig1.subplots_adjust(left=0.07, bottom=0.07, right=0.95, top=0.95, wspace=0.2, hspace=0.25)
+        fig2.subplots_adjust(left=0.07, bottom=0.07, right=0.95, top=0.95, wspace=0.1, hspace=0.22)
  
         if save_path:
             sf1 = save_path.format('scatter')
@@ -1804,25 +2418,32 @@ class SchisomeDataSet(BaseDataSet):
  
     
     def plot_dual_proj_2d(self, profile_label, proj_method='umap', title=None,
-                           min_nonzero=0.8, plot_size=8.0, spot_size=5, alpha=0.25,
-                           save_path='png/Dual_loc_{}.png'):
+                           min_nonzero=0.65, plot_size=7.0, spot_size=5, alpha=0.25,
+                           save_path='png/Dual_loc_{}.png', p_lim=1e-3):
         
         if not title:
-            title = f'{proj_method.upper()} 2D'
+            title = f'{self.name} {proj_method.upper()} 2D'
  
         self._check_profile_label(profile_label)
         profile_data = self.get_profile_data(profile_label)
         
-        valid = np.count_nonzero(np.isnan( self.train_profiles), axis=-1) <= 28
+        #valid = np.count_nonzero(np.isnan(self.train_profiles), axis=-1) >= int(min_nonzero * profile_data.shape[1])
+        valid = self.get_array_data('completeness') >= min_nonzero
+        
         profile_data = np.nan_to_num(profile_data)
  
         score_array = self.class_ensemble_preds
         class_labels = self.train_labels
+        pvals2 = self.get_array_data('pval2')[valid]
+        pvals1 = self.get_array_data('pval1')[valid]
  
         profile_data = profile_data[valid]
         score_array = score_array[valid]
         score_array = score_array.mean(axis=1)
- 
+        score_idx = score_array.argsort(axis=1)
+        first_idx = score_idx[:,-1]
+        second_idx = score_idx[:,-2]
+         
         c1 = np.array([1.0,0.0,0.0])
         c2 = np.array([0.0,0.0,1.0])
         c3 = np.array([0.8,0.8,0.0])
@@ -1853,8 +2474,8 @@ class SchisomeDataSet(BaseDataSet):
  
             hex_color = COLOR_DICT[klass1]
             rgb1 = np.array([int(hex_color[1:3], 16),
-                                             int(hex_color[3:5], 16),
-                                             int(hex_color[5:7], 16)], float) /255.0
+                             int(hex_color[3:5], 16),
+                             int(hex_color[5:7], 16)], float) /255.0
  
             for j, klass2 in enumerate(class_labels):
                 col = j // nrows
@@ -1870,20 +2491,26 @@ class SchisomeDataSet(BaseDataSet):
                 frac[nz] = pred2[nz] / intens[nz]
  
                 if i == j:
-                    idx = (pred1 >= 0.8).nonzero()[0]
+                    selection = (pvals1 < p_lim) & (first_idx == i)
+                    idx = selection.nonzero()[0]
+                    
                     ax0.scatter([], [], color=rgb1, label=f'{klass1} ({len(idx):,})', marker='*', alpha=1.0, s=2*spot_size)
  
                 else:
                     hex_color = COLOR_DICT[klass2]
                     rgb2 = np.array([int(hex_color[1:3], 16),
-                                                     int(hex_color[3:5], 16),
-                                                     int(hex_color[5:7], 16)], float) /255.0
+                                     int(hex_color[3:5], 16),
+                                     int(hex_color[5:7], 16)], float) /255.0
  
-                    selection = (pred1 < 0.8) & (pred2 < 0.8) & (pred1 > 0.35) & (pred2 > 0.35)
+                    #selection = (pred1 < 0.8) & (pred2 < 0.8) & (pred1 > 0.35) & (pred2 > 0.35)
+                    
+                    selection = (pvals1 > p_lim) & (pvals2 <= p_lim) & (second_idx == j) & (first_idx == i)
                     idx = selection.nonzero()[0]
-                    colors0[idx] = rgb2 * intens[idx,None] + (1.0-intens[idx,None]) * cbg
-                    zorder0[idx] = intens[idx]
-                    ax0.scatter([], [], color=rgb2, label=f'{klass2} ({len(idx):,})', alpha=0.75, s=spot_size)
+                    
+                    if len(idx) > 0:
+                        colors0[idx] = rgb2 * intens[idx,None] + (1.0-intens[idx,None]) * cbg
+                        zorder0[idx] = intens[idx]
+                        ax0.scatter([], [], color=rgb2, label=f'{klass2} ({len(idx):,})', alpha=0.75, s=spot_size)
 
                 colors = []
                 for a, f in enumerate(frac):
@@ -1940,11 +2567,11 @@ class SchisomeDataSet(BaseDataSet):
             colors0[idx] = rgb1 * intens[idx,None] + (1.0-intens[idx,None]) * cbg
             colors0 = np.clip(colors0, 0.0, 1.0)
             ax0.scatter(x_vals[selected], y_vals[selected], alpha=0.4, s=2*spot_size,
-                                    color=colors0[selected], edgecolors='none', zorder=2, marker='*')
+                        color=colors0[selected], edgecolors='none', zorder=2, marker='*')
  
             selected = zorder0 > 0.7
             ax0.scatter(x_vals[selected], y_vals[selected], alpha=0.75, s=spot_size,
-                                    color=colors0[selected], zorder=5)
+                        color=colors0[selected], zorder=5)
             ax0.legend(fontsize=5.5, frameon=False)
 
             if save_path:
@@ -1991,8 +2618,8 @@ class SchisomeDataSet(BaseDataSet):
         self. _plot_proj_2d(*args, **kw)
              
     
-    def get_profile_proj_2d(self, label, method, min_nonzero=0.5, recalc=False, tsne_perplexity=30.0,
-                            umap_neighbours=7, umap_mindist=0.1, metric='correlation'):
+    def get_profile_proj_2d(self, label, method, min_nonzero=0.8, recalc=False, tsne_perplexity=30.0,
+                            umap_neighbours=30, umap_mindist=0.1, metric='correlation'):
         
         from sklearn.decomposition import PCA, FastICA
         from sklearn.manifold import TSNE
@@ -2232,8 +2859,8 @@ class SchisomeDataSet(BaseDataSet):
         class_std = pred_data.std(axis=1)
         class_idx = class_mean.argsort(axis=-1)
         
-        proj_srcs = ('latent','init','recon','zfill')        
-        proj_names = {'latent':'DNN Latent', 'init':'Original','recon':'Reconstructed','zfill':'Zero-filled',}
+        proj_srcs = ('latent','init','recon') # ,'zfill')        
+        proj_names = {'latent':'DNN Latent', 'init':'Original','recon':'De-noised'} # ,'zfill':'Zero-filled',}
         
         pids = self.proteins
         title_dict = self.get_prot_titles(pids)
@@ -2244,9 +2871,9 @@ class SchisomeDataSet(BaseDataSet):
         
         restriction_min_score = 0.3
         restrict_groups = {'SECRETORY':['ER', 'GOLGI', 'PM', 'TGN'],
-                           'CHR-MT-PRX-CYT':['CYTOSOL', 'CHLOROPLAST', 'MITOCHONDRION', 'PEROXISOME'],
-                           'PM-CYT-NUC-ER-PM':['NUCLEUS', 'ER', 'PM', 'CYTOSOL'],
-                           'CARGO+':['EXTRACELLULAR', 'TGN', 'CHLOROPLAST', 'ER','GOLGI'],
+                           #'CHR-MT-PRX-CYT':['CYTOSOL', 'CHLOROPLAST', 'MITOCHONDRION', 'PEROXISOME'],
+                           'PM-CYT-NUC-ER':['NUCLEUS', 'ER', 'PM', 'CYTOSOL'],
+                           #'CARGO+':['EXTRACELLULAR', 'TGN', 'CHLOROPLAST', 'ER','GOLGI'],
                           }
          
         from umap import UMAP
@@ -2258,7 +2885,7 @@ class SchisomeDataSet(BaseDataSet):
                 text = f'{proj_names[src]} {method.upper()}'
                 
                 if method == 'umap':
-                    for nn in (50,30,10):
+                    for nn in (30,): # 30,10):
                         key = f'{src}_{method}_{nn}'
                         self.info(f' .. {key}')
                         text = f'{proj_names[src]} {method.upper()} NN{nn}'
@@ -2291,7 +2918,8 @@ class SchisomeDataSet(BaseDataSet):
                 proj_2d[key] = proj_model.transform(profile_data_all)
                 proj_2d[key][invalid] = 0.0
                 proj_2d[key][~selection] = 0.0
-                
+        
+        projections.sort()     
         cursor = connection.cursor()
         cursor.executemany('INSERT INTO DataProjection (code, name) VALUES (?,?)', projections)
         cursor.close()
@@ -2308,7 +2936,7 @@ class SchisomeDataSet(BaseDataSet):
         pvals = self.get_array_data('pval')
         pvals_single = self.get_array_data('pval1')
         pvals_dual = self.get_array_data('pval2')
-        novelty = self.get_array_data('novelty')
+        duality = self.get_array_data('duality')
         completeness = self.get_array_data('completeness')
         singleness = self.get_array_data('singularity')
         predictions1 = self.get_marker_data('prediction')
@@ -2364,7 +2992,7 @@ class SchisomeDataSet(BaseDataSet):
             protein_inserts.append((pid, alt_ids, description, gene_name, train_organelle,
                                     suborganelle, alt_organelle, singleness[i], likely_single, pred_class1,
                                     pred_class2, pred_class3, pred_text, pvals[i], pvals_single[i],
-                                    pvals_dual[i], completeness[i], novelty[i]))    
+                                    pvals_dual[i], completeness[i], duality[i]))    
             
             for k, klass in enumerate(class_heads):
                 protein_score_inserts.append((klass, pid, float(class_mean[i,k]), float(class_std[i,k])))
@@ -2393,7 +3021,7 @@ class SchisomeDataSet(BaseDataSet):
         connection.close()            
 
  
-    def get_train_test_data(self, profile_label=None, marker_label=None, n_chunks=5, max_nan=10): 
+    def get_train_test_data(self, profile_label=None, marker_label=None, n_chunks=10, max_nan=10): 
         
         if marker_label:
             marker_data = self.get_marker_data(marker_label)
@@ -2422,11 +3050,79 @@ class SchisomeDataSet(BaseDataSet):
         
         return valid, idx_chunks, profile_data, marker_data
         
+   
+    def svm_fit_predict(self, max_missing=0.35, prob_thresh=0.8):
+               
+        import sklearn
+        from sklearn.impute import KNNImputer
+        
+        train_groups = self.train_groups.astype(int)
+        m = int(train_groups.max())
+        class_labels = self.train_labels # Text labels for the indices
+        k = len(class_labels)
+         
+        self.info(f'Training {m} SVM models')
+        self.info(f" .. {k} classes : {','.join(class_labels)}")
+                
+        input_data = self.train_profiles
+        targets = self.train_markers # Indices
+        invalid = np.count_nonzero(np.isnan(input_data), axis=-1) > int(max_missing*input_data.shape[1])
+        
+        # Normalise : mainly for consistency with ext mathods
+        self.info(f' .. normalize')
+        col_meds  = np.nanmedian(input_data, axis=0)[None,:]
+        nans = np.isnan(input_data)
+        
+        input_data = np.log2(np.nan_to_num(input_data, -1.0)) - col_meds
+        input_data = 2.0 ** input_data 
+        input_data /= input_data.max(axis=0)[None,:]
+        input_data[nans] = np.nan        
+        
+        n, d = input_data.shape
+        self.info(f" .. total data size {n:,} rows x {d} cols")
+        ensemble_preds = np.zeros((n, m, k))
+        
+        for i in range(m):
+            
+            is_train = (train_groups != i+1) & (train_groups != 0) # Zero index is invalid due to low counts
+            is_train &= (targets > -1) # Was used in DNN for reconstruction but not valid here ; no merker class
+            
+            profs = input_data[is_train]
+            target_idx = targets[is_train]
+            
+            self.info(f' .. impute missing {i+1}')
+           
+            imputer = KNNImputer(n_neighbors=9, weights="uniform")
+            imputer.fit(profs)
+            
+            profs = imputer.transform(profs)
+            a, b = profs.shape
+            
+            self.info(f' .. fit model {i+1} : {a} rows x {b} cols')
+            svm_model = sklearn.svm.SVC(probability=True, verbose=0)
+            svm_model.fit(profs, target_idx)
+            
+            self.info(f' .. get scores {i+1}')
+            
+            all_profs = imputer.transform(input_data) # Impute based in current training set
+            svm_scores = svm_model.predict_proba(all_profs)
+            
+            ensemble_preds[:,i,:] = svm_scores        
+        
+        mean_scores = ensemble_preds.mean(axis=1)
+        best_scores = mean_scores.max(axis=1)
+        top_preds = mean_scores.argmax(axis=1)
+        top_preds[best_scores < prob_thresh] = -1
+        
+        self.info(f' .. saving to key "{self._pred_svm_key}"')
+        self.set_pred_class_data(self._pred_svm_key, ensemble_preds, targets)
+               
+        self.set_marker_data('svm_prediction', top_preds, class_labels)
+
     
     def prune_markers(self, in_marker_label, out_marker_label, fixed_classes=None, sparse_classes=None,
-                      n_neighbors=11, n_rounds=1, corr_min=0.9):
+                      n_neighbors=7, n_rounds=2, corr_min=0.9):
         
-        from scipy.spatial import distance
         from sklearn.neighbors import KNeighborsClassifier
         
         if not fixed_classes:
@@ -2442,7 +3138,8 @@ class SchisomeDataSet(BaseDataSet):
         
         in_valid = ~self.get_valid_mask()
         marker_idx[in_valid] = -1
-         
+        
+        marker_idx_orig = np.array(marker_idx)
         clear_train_class = np.zeros(n, dtype=bool)
         clear_train_class[in_valid] = True        
         
@@ -2457,21 +3154,28 @@ class SchisomeDataSet(BaseDataSet):
              inconsistent = knn_idx != marker_idx[labelled]
              
              clear_train_class[labelled] = inconsistent
-
+             
              self.info(f'Round {i+1} : Removing {inconsistent.sum():,} of {len(labelled):,} labels from {n:,} profiles')
  
              for k, klass in enumerate(marker_klasses):
                    idx = (marker_idx == k).nonzero()[0]
+                   if (i == 0) and (klass in sparse_classes):
+                       clear_train_class[idx] = False # Keep for now
+                       continue
+
+                   if (i > 0) and (klass not in sparse_classes):
+                       clear_train_class[idx] = False
+                       continue
  
                    if (klass in fixed_classes):
                        self.info(f' .. keeping all of class {klass} : {len(idx):,}')
                        clear_train_class[idx] = False
                        
                    else:
+                       n_peripheral = 0
                        
                        if klass not in sparse_classes:
                            klass_profs = profile_data[idx]
-                           n_peripheral = 0
  
                            for a, prof in enumerate(klass_profs):
                                 corr_dists = distance.cdist(prof[None,:], klass_profs, metric='correlation')[0]
@@ -2483,13 +3187,14 @@ class SchisomeDataSet(BaseDataSet):
  
                        n_remove = clear_train_class[idx].sum()
                        self.info(f' .. pruned class {klass} : removed {n_remove:,} of {len(idx):,} ; peripheral {n_peripheral:,}')
- 
- 
+             
              marker_idx[clear_train_class] = -1
-         
+
+        removed = marker_idx != marker_idx_orig
         marker_data_prune = np.full(n, -1, dtype=int)
-        marker_data_prune[clear_train_class] = marker_idx[clear_train_class]
+        marker_data_prune[removed] = marker_idx_orig[removed]
+        
         
         self.set_marker_data(out_marker_label, marker_idx, marker_klasses)
         self.set_marker_data(f'pruned_{in_marker_label}', marker_data_prune, marker_klasses)
-
+    

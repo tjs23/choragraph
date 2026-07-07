@@ -1,4 +1,4 @@
-import os
+import os, re
 import numpy as np
 from collections import defaultdict
 
@@ -10,7 +10,7 @@ from constants import MARKER_CLASSES_TAG, MARKER_COLORS_TAG, MARKER_LABELS_TAG, 
 import warnings
 warnings.filterwarnings("ignore")
 
-class SchisomeException(Exception):
+class ChoragraphException(Exception):
     
     def __init__(self, *args):
    
@@ -34,7 +34,7 @@ class BaseDataSet:
         if os.path.exists(file_path):
             if file_ext != '.npz':
                 msg = 'File does not have .npz file extension'
-                raise SchisomeException(msg)
+                raise ChoragraphException(msg)
                 
             elif aux_marker_key:
                 self._save_data({'aux_marker_key': aux_marker_key})
@@ -58,6 +58,8 @@ class BaseDataSet:
         self._zfill_profile_key = 'zfill'
         
         self._pred_all_key = 'class_pred_all'                
+        self._pred_svm_key = 'class_pred_svm'
+                        
         self._train_groups_key = 'train_groups'
     
     
@@ -88,6 +90,12 @@ class BaseDataSet:
     def class_ensemble_preds(self):
          
         return self.get_pred_class_data(self._pred_all_key) 
+
+   
+    @property
+    def class_ensemble_preds_svm(self):
+         
+        return self.get_pred_class_data(self._pred_svm_key) 
  
  
     @property
@@ -193,7 +201,7 @@ class BaseDataSet:
         
         if not os.path.exists(file_path):
             msg = f'File "{file_path}" doe not exist'
-            raise SchisomeException(msg)
+            raise ChoragraphException(msg)
     
     
     def _check_pids(self, info='proceed'):
@@ -202,7 +210,7 @@ class BaseDataSet:
         
         if 'pids' not in save_dict:
             msg = f'Cannot {info}. No protein IDs loaded'
-            raise SchisomeException(msg)
+            raise ChoragraphException(msg)
     
     
     def _get_save_dict(self):
@@ -242,7 +250,19 @@ class BaseDataSet:
 
 
     def _get_uniprot_cache(self, redo=False, cache_file='uniprot_cache.tsv'):
-
+        
+        UNIPROT_FIELDS = ['gene_primary', 'gene_synonym', 'gene_oln', 'gene_orf', 'protein_name', 'xref_araport', 'xref_tair']
+        
+        def _merge_gene_names(ddict):
+            
+            for pid in ddict:
+                gene_primary, gene_synonym, gene_oln, gene_orf, protein_name, xref_araport, xref_tair = ddict[pid]
+                gene_name = gene_primary or gene_synonym or gene_oln or gene_orf or 'None'
+                ddict[pid] = (gene_name, protein_name, xref_araport, xref_tair)
+            
+            return ddict
+        
+        
         pids = [pid.split('-')[0] for pid in self.proteins if not pid.startswith('cRAP')]
         up_dict = {}
         missing_in_cache = set()
@@ -272,7 +292,7 @@ class BaseDataSet:
              
         if missing_in_cache:
             self.info(f'Proteins missing in cache: {len(missing_in_cache):,}')
-            up_dict2 = get_uniprot_columns(sorted(missing_in_cache), ['gene_primary', 'protein_name', 'xref_araport', 'xref_tair'])
+            up_dict2 = _merge_gene_names(get_uniprot_columns(sorted(missing_in_cache), UNIPROT_FIELDS))
             up_dict.update(up_dict2)
             
             missing_in_uniprot = []
@@ -297,7 +317,7 @@ class BaseDataSet:
                         resolved += 1
                  
                 if new_ids:
-                    up_dict2 = get_uniprot_columns(sorted(new_ids), ['gene_primary','protein_name', 'xref_araport', 'xref_tair'])
+                    up_dict2 = _merge_gene_names(get_uniprot_columns(sorted(new_ids), UNIPROT_FIELDS))
                     up_dict.update(up_dict2)
  
                     pids = [obsolete_to_valid.get(pid, pid) for pid in pids]
@@ -345,16 +365,11 @@ class BaseDataSet:
         return up_dict
 
 
-    def normalize_profiles_max(self, key, col_norm=False):
-     
+    def normalize_profiles_max(self, key):
+        
         profile_data = self.get_profile_data(key)
 
         n, m = profile_data.shape
- 
-        if col_norm:
-            for k in range(m):
-                col = profile_data[:,k]
-                profile_data[:,k] /= np.median(col[col > 0])
         
         mn = np.nanmin(profile_data, axis=1)
         profile_data -= mn[:,None]
@@ -363,6 +378,18 @@ class BaseDataSet:
         mx = np.nanmax(profile_data, axis=1)
         nz = mx != 0.0
         profile_data[nz] /= mx[nz,None]
+
+        self.set_profile_data(key, profile_data)
+
+
+    def normalize_profiles_standard(self, key):
+        
+        profile_data = self.get_profile_data(key)
+
+        n, m = profile_data.shape
+        
+        profile_data -= np.nanmean(profile_data, axis=1)[:,None]
+        profile_data /= np.nanstd(profile_data, axis=1)[:,None]
 
         self.set_profile_data(key, profile_data)
      
@@ -398,9 +425,14 @@ class BaseDataSet:
                 gene_name, desc = up_dict[pid][:2]
             else:
                 gene_name, desc = pid, 'Unknown'
-        
-            if ' (' in desc:
-                desc = desc.split(' (')[0]
+
+            desc = re.sub('\s+\(EC .+?\)', '', desc)
+            
+            while (len(desc) > 96) and re.search('\s+\(.+?\)\s*$', desc):
+                desc = re.sub('\s+\(.+?\)\s*$', '', desc)
+
+            while (len(desc) > 96) and re.search('\s+\[.+?\]\s*$', desc):
+                desc = re.sub('\s+\[.+?\]\s*$', '', desc)
  
             title_dict[pid] = f'{gene_name or pid} : {desc or "Unknown"}'
  
@@ -526,7 +558,7 @@ class BaseDataSet:
         if not self.has_array_key(label):
             avail = ', '.join(self.array_keys)
             msg = f'Array values "{label}" not in array list. Available: {avail}'
-            raise SchisomeException(msg)
+            raise ChoragraphException(msg)
             
 
     def _check_marker_key(self, label):
@@ -534,7 +566,7 @@ class BaseDataSet:
         if not self.has_marker_key(label):
             avail = ', '.join(self.marker_keys)
             msg = f'Marker set "{label}" not in marker list. Available: {avail}'
-            raise SchisomeException(msg)
+            raise ChoragraphException(msg)
             
     
     def _check_pred_class_key(self, label):
@@ -545,7 +577,7 @@ class BaseDataSet:
         if key not in save_dict:
             avail = ', '.join(self.pred_classes_labels)
             msg = f'Predicited classes "{label}" not in list. Available: {avail}'
-            raise SchisomeException(msg)
+            raise ChoragraphException(msg)
     
     
     def get_marker_data(self, label):
@@ -709,8 +741,8 @@ class BaseDataSet:
         return profile_dict    
     
     
-    def add_raw_profiles(self, file_paths):
-        
+    def add_raw_profiles(self, file_paths, norm=True, add_intens=True):
+        from matplotlib import pyplot as plt
         if self.proteins:
             self.warn(f'Replacing raw profiles in {self._data_store}')
         
@@ -746,9 +778,27 @@ class BaseDataSet:
                 
             label = f'{RAW_DATA_TAG}{i:04d}_{os.path.basename(file_path)}'
             new_data[label] = data_array
+            
+            # Keep overall relative abundance information as a separate column to normalised values
+            if add_intens:
+                intens = np.log(1e-5 + np.nansum(data_array, axis=1))
+                intens[intens < 1.0] = np.nan
+                intens /= 5.0 * np.nanmedian(intens)
+            
+            #data_array /= np.nanmedian(np.log2(data_array), axis=0)[None,:]
+            if norm:            
+                data_array /= np.nansum(data_array, axis=1)[:,None]
+            
+            if add_intens:
+                data_array = np.concatenate([data_array, intens[:,None]], axis=1)
+            
             comb_profiles.append(data_array)
         
         comb_profiles = np.concatenate(comb_profiles, axis=1)
+        if norm:
+           #comb_profiles /= np.nanquantile(comb_profiles, 0.95)
+           comb_profiles /= np.nanmax(comb_profiles)
+        
         n, m = comb_profiles.shape
 
         new_data[PROFILE_TAG + self._train_profile_key] = comb_profiles
@@ -818,11 +868,11 @@ class BaseDataSet:
 
         if marker_idx.ndim != 1:
             msg = f'Marker indexes are not a one dimensional array'
-            raise SchisomeException(msg)
+            raise ChoragraphException(msg)
         
         if n != len(marker_idx):
             msg = f'Marker index array length {len(marker_idx):,} does not match the number of proteins {n:,}'
-            raise SchisomeException(msg)            
+            raise ChoragraphException(msg)            
  
         new_data = {MARKER_LABELS_TAG + label: np.array(marker_klasses),
                     MARKER_CLASSES_TAG + label: marker_idx}
@@ -866,11 +916,11 @@ class BaseDataSet:
 
         if values.ndim != 1:
             msg = f'Values are not a one dimensional array'
-            raise SchisomeException(msg)
+            raise ChoragraphException(msg)
         
         if n != len(values):
             msg = f'Value array length {len(values):,} does not match the number of proteins {n:,}'
-            raise SchisomeException(msg)            
+            raise ChoragraphException(msg)            
  
         new_data = {ARRAY_VALUES_TAG + label: values}
                                 
@@ -886,11 +936,11 @@ class BaseDataSet:
 
         if klass_data.ndim not in (2,3):
             msg = f'Predicted class data not a two or three dimensional array (n_proteins, [n_replicas], n_classes)'
-            raise SchisomeException(msg)
+            raise ChoragraphException(msg)
         
         if n != len(klass_data):
             msg = f'Predicted class array length {len(klass_data):,} does not match the number of proteins {n:,}'
-            raise SchisomeException(msg)            
+            raise ChoragraphException(msg)            
 
         new_data = {PRED_LABELS_TAG + label: np.array(klass_labels),
                     PRED_CLASSES_TAG + label: klass_data}
@@ -906,11 +956,11 @@ class BaseDataSet:
 
         if data_array.ndim != 2:
             msg = f'Profile data is not two dimensional (proteins rows, fraction columns)'
-            raise SchisomeException(msg)
+            raise ChoragraphException(msg)
         
         if n != len(data_array):
             msg = f'Profile data length {len(data_array):,} does not match the number of proteins {n:,}'
-            raise SchisomeException(msg)            
+            raise ChoragraphException(msg)            
 
         key = PROFILE_TAG + label
         
@@ -930,7 +980,7 @@ class BaseDataSet:
         if not self.has_profile_key(label):
             avail = ', '.join(self.profile_keys)
             msg = f'Profile set "{label}" not in profiles list. Available: {avail}'
-            raise SchisomeException(msg)
+            raise ChoragraphException(msg)
          
     
     def get_profile_data(self, label):
@@ -1124,7 +1174,6 @@ class BaseDataSet:
                     pid = pid.split('-')[0]
                     
                     if pid not in pids:
-                        print('##', pid, rev_id_map.get(pid), id_mapping.get(pid))
                         if pid in rev_id_map:
                             pid = list(rev_id_map[pid])[0]
  
@@ -1184,18 +1233,28 @@ class BaseDataSet:
          
         for key in keys:
             n, m = save_dict[key].shape
-            replica_widths.append(m)
+            replica_widths.append(m+1)
   
         
         if len(replica_widths) == 1:
             s = replica_widths[0]
-            for w in (11, 18, 16, 10): # Commoon TMT tag counts
+            for w in (11, 12, 18, 16, 10): # Common TMT tag counts
                 if s % w == 0:
                     replica_widths = [w]  * (s//w)
                     break                     
         
         return replica_widths
 
+    @property
+    def orig_cols(self):
+    
+        replica_widths = self.replica_cols
+        extra_cols = np.cumsum(replica_widths)-1
+        idx = np.arange(extra_cols[-1]+1)
+        idx = np.delete(idx, extra_cols)
+ 
+        return idx
+        
 
     def get_valid_mask(self, min_nonzero=0.8, profile_key=None):
         
